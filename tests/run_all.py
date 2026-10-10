@@ -4,7 +4,9 @@
     python tests/run_all.py guards     # 只跑名字里含 guards 的套件
 
 编排照抄 wb 的 tests/run_all.py：并发执行、每套件独立日志文件、失败打印 tail 25 行、
-强制 UTF-8（子进程 stdout 编码 + 日志写入）。套件名规范 _test_*.py（.js 需要 node）。
+强制 UTF-8（子进程 stdout 编码 + 日志写入）。套件名规范 _test_*.py；.js 套件需要 node，
+shutil.which("node") 判定缺失时打印 [SKIP]（alpine 镜像无 node 时直接 subprocess 会
+FileNotFoundError 把整个编排打挂——tests/README.md 承诺的「自动跳过」此前并不成立）。
 """
 import concurrent.futures as _cf
 import os
@@ -26,9 +28,18 @@ def suites(pattern=""):
 
 
 def command(name):
+    """套件 -> 命令行；.js 套件在 node 缺失时返回 None（由编排层打印 [SKIP]）。
+
+    用 shutil.which 判定而不是让 subprocess.call 自己抛 FileNotFoundError：
+    ThreadPoolExecutor 里任何一个子进程抛异常都会让 ex.map 传播、整个编排
+    直接退出（.js 套件归零，连 .py 套件的结果都打印不出来）。
+    """
     path = os.path.join(HERE, name)
     if name.endswith(".js"):
-        return ["node", path]
+        node = shutil.which("node")
+        if not node:
+            return None
+        return [node, path]
     return [sys.executable, path]
 
 
@@ -57,9 +68,12 @@ def total_of(path):
 
 
 def run_one(name, logdir, env):
+    cmd = command(name)
+    if cmd is None:                       # node 缺失的 .js 套件：跳过，不崩编排
+        return name, None, None
     log = os.path.join(logdir, name + ".log")
     with open(log, "wb") as fh:
-        rc = subprocess.call(command(name), stdout=fh,
+        rc = subprocess.call(cmd, stdout=fh,
                              stderr=subprocess.STDOUT, env=env, cwd=HERE)
     return name, rc, log
 
@@ -77,15 +91,18 @@ def main(argv):
     env["PYTHONPATH"] = os.pathsep.join(
         [ROOT] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
     env["PYTHONIOENCODING"] = "utf-8"
-    if not shutil.which("node"):
-        env.pop("NODE_OK", None)
     logdir = tempfile.mkdtemp(prefix="qd-suites-")
     with _cf.ThreadPoolExecutor(max_workers=JOBS) as ex:
         results = list(ex.map(lambda n: run_one(n, logdir, env), selected))
     failed = []
+    skipped = []
     grand = 0
     unknown = []
     for name, rc, log in results:
+        if rc is None:
+            skipped.append(name)
+            print("  %-34s [SKIP]    checks=- （node 未安装，.js 套件自动跳过）" % name)
+            continue
         n = total_of(log)
         if n is None:
             unknown.append(name)
@@ -101,8 +118,9 @@ def main(argv):
         for line in tail(log):
             print("    " + line)
     print("")
-    print("SUMMARY: %d suites, %d passed, %d failed, TOTAL %d checks%s  (logs: %s)"
-          % (len(results), len(results) - len(failed), len(failed), grand,
+    print("SUMMARY: %d suites, %d passed, %d failed, %d skipped, TOTAL %d checks%s  (logs: %s)"
+          % (len(results), len(results) - len(failed) - len(skipped), len(failed),
+             len(skipped), grand,
              ("" if not unknown else " (+%d suites without SUMMARY: %s)"
               % (len(unknown), ", ".join(unknown))), logdir))
     return 1 if failed else 0

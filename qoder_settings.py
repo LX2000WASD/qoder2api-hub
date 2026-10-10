@@ -7,6 +7,7 @@ password is never stored in clear text - only a PBKDF2-SHA256 digest.
 Only the Python standard library is required.
 """
 
+import copy
 import fnmatch
 import hashlib
 import hmac
@@ -19,10 +20,17 @@ import time
 from pathlib import Path
 
 DEFAULT_PANEL_PASSWORD = "admin"
-PBKDF2_ROUNDS = 120_000
+# OWASP 2023 建议 >= 600k 轮（面板登录一次的耗时完全可接受）。
+# 旧版本的哈希用 120_000 落盘；读取时按存储的 panel_password_rounds 验证，
+# 字段缺失的极旧文件回落 LEGACY_PBKDF2_ROUNDS，升级不锁死旧密码。
+PBKDF2_ROUNDS = 600_000
+LEGACY_PBKDF2_ROUNDS = 120_000
 SESSION_TTL = 7 * 24 * 3600
 
 _lock = threading.RLock()
+
+# settings.json 读缓存：<绝对路径> -> (mtime_ns, size, data)。save() 写后失效。
+_settings_cache = {}
 
 
 def settings_path(accounts_dir):
@@ -35,23 +43,51 @@ def _digest(password, salt_hex, rounds=PBKDF2_ROUNDS):
     ).hex()
 
 
+def _cache_key(accounts_dir):
+    return os.path.abspath(settings_path(accounts_dir))
+
+
 def load(accounts_dir):
-    """Return the persisted settings, or an empty dict on a fresh install."""
+    """Return the persisted settings, or an empty dict on a fresh install.
+
+    match_api_key 每个请求都调这里：全量 json.load 一次解析几百微秒，
+    高并发下并不便宜。命中 (mtime_ns, size) 未变时直接返回缓存深拷贝——
+    安全语义不变（key 比较仍在 hmac.compare_digest 里做），只是少读盘。
+    深拷贝必须：调用方习惯就地改 dict 再 save()，共享引用会污染缓存。
+    """
     path = settings_path(accounts_dir)
+    try:
+        st = os.stat(path)
+    except OSError:
+        with _lock:
+            _settings_cache.pop(_cache_key(accounts_dir), None)
+        return {}
+    key = _cache_key(accounts_dir)
+    with _lock:
+        hit = _settings_cache.get(key)
+        if hit is not None and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+            return copy.deepcopy(hit[2])
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
-        if isinstance(data, dict):
-            return data
-    except FileNotFoundError:
-        pass
+        st_after = os.stat(path)   # 读穿防护：读期间被改的这一次不进缓存
     except Exception:
-        pass
-    return {}
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    if st_after.st_mtime_ns == st.st_mtime_ns and st_after.st_size == st.st_size:
+        with _lock:
+            _settings_cache[key] = (st.st_mtime_ns, st.st_size, data)
+    return copy.deepcopy(data)
 
 
 def save(accounts_dir, data):
-    """Atomic write so a crash cannot leave a half-written settings file."""
+    """Atomic write so a crash cannot leave a half-written settings file.
+
+    临时文件先 chmod 0600 再 rename：跟随 umask 会落 0644，而 settings.json
+    里是 API key 明文——同机任何用户都不该读。写完作废读缓存（下一次
+    load 重新读盘，同进程内的其它读者立即看到新值）。
+    """
     with _lock:
         base = Path(accounts_dir).resolve()
         base.mkdir(parents=True, exist_ok=True)
@@ -61,7 +97,10 @@ def save(accounts_dir, data):
             raise ValueError("path escapes base directory")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2),
                        encoding="utf-8")
+        os.chmod(tmp, 0o600)
         os.replace(tmp, path)
+        _settings_cache.pop(_cache_key(accounts_dir), None)
+        _settings_cache.pop(str(path), None)
         return str(path)
 
 
@@ -72,19 +111,49 @@ def panel_password_is_default(accounts_dir):
     return data.get("panel_password_default") is True
 
 
+def _mark_default_login(accounts_dir):
+    """首次用默认密码登录成功时落后端字段 panel_default_login_at。
+
+    看板据此提示「你还在用默认密码 admin，请改掉」——前端展示逻辑在另外的
+    修改里接，这里只保证字段存在。幂等：已标记就直接返回；settings.json 只读
+    或不可写时静默失败，绝不让写盘异常反过来把登录打成 500。
+    """
+    try:
+        with _lock:
+            data = load(accounts_dir)
+            if data.get("panel_default_login_at"):
+                return
+            data["panel_default_login_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            save(accounts_dir, data)
+    except Exception:
+        pass
+
+
 def verify_panel_password(accounts_dir, password):
-    """True when `password` opens the web panel."""
+    """True when `password` opens the web panel.
+
+    所有比较都走 hmac.compare_digest：默认密码分支也不该用 `==`——
+    定时侧信道在默认密码上同样能区分「差一位」与「差两位」。
+    """
     password = password or ""
     data = load(accounts_dir)
     stored = data.get("panel_password_hash")
     if not stored:
-        return password == DEFAULT_PANEL_PASSWORD
+        if hmac.compare_digest(password, DEFAULT_PANEL_PASSWORD):
+            _mark_default_login(accounts_dir)
+            return True
+        return False
     if data.get("panel_password_default") is True:
-        return password == DEFAULT_PANEL_PASSWORD
+        if hmac.compare_digest(password, DEFAULT_PANEL_PASSWORD):
+            _mark_default_login(accounts_dir)
+            return True
+        return False
     salt = data.get("panel_password_salt")
     if not salt:
         return False
-    rounds = int(data.get("panel_password_rounds") or PBKDF2_ROUNDS)
+    # 轮次随哈希存储：本机落盘的旧哈希写的是多少就验证多少（兼容升级）；
+    # 字段缺失的极旧文件回落当时的 120_000 轮。
+    rounds = int(data.get("panel_password_rounds") or LEGACY_PBKDF2_ROUNDS)
     try:
         given = _digest(password, salt, rounds)
     except Exception:

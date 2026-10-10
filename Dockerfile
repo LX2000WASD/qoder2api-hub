@@ -5,18 +5,27 @@
 # 纯标准库 python 实现（不需要 node）；npm 包只在 builder 阶段存在——31MB 的
 # tarball 与下载过程都不会进入最终镜像。提取失败不阻断构建：那种情况下网关
 # 退化为 derived 身份（活动列表可能被服务端过滤，见 issue #10），功能仍可用。
+# 可复现性：默认解析 dist-tags.latest（随上游发版漂移）；需要钉死来源版本时
+#   docker build --build-arg QODERCLI_VERSION=1.1.65 .
+# 实际解析到的版本会落进 /app/umid/.qodercli-version，latest 模式也能溯源。
 # ---------------------------------------------------------------------------
 FROM python:3.11-alpine AS umid-builder
 ARG TARGETARCH
+ARG QODERCLI_VERSION=latest
 WORKDIR /build
 COPY _install_umid.py ./
 RUN apk add --no-cache ca-certificates && \
     arch="x64"; [ "$TARGETARCH" = "arm64" ] && arch="arm64"; \
-    python _install_umid.py --platform linux --arch "$arch" --dest /build/umid || \
+    python _install_umid.py --platform linux --arch "$arch" --version "$QODERCLI_VERSION" --dest /build/umid || \
     echo "WARN: UMID extraction failed (gateway will fall back to derived identity)"; \
     mkdir -p /build/umid
 
 FROM python:3.11-alpine
+
+# 锁定构建时把来源版本写进镜像标签（可复现性；默认 latest=跟随上游）。
+# 下面 builder 提取的真实版本另存于 /app/umid/.qodercli-version。
+ARG QODERCLI_VERSION=latest
+LABEL org.opencontainers.image.qodercli-version="${QODERCLI_VERSION}"
 
 # Set environment
 # 注：API_KEY 默认为空，只作为 compose / docker run -e 的覆盖入口，不承载任何密钥。
@@ -59,8 +68,19 @@ COPY --from=umid-builder /build/umid /app/umid
 COPY _test_qoder.py _diag_gateway.py _diag_campaign.py _verify_models.py \
      _refresh_catalog.py _install_umid.py ./
 
-# Create data directories
-RUN mkdir -p /app/accounts /app/usage
+# tests/ 编排（约 200KB，纯标准库）：容器内可跑完整套件自检——
+#   docker run --rm qoder-proxy:latest python tests/run_all.py
+# .js 套件需要 node（镜像内没有，自动 [SKIP]）；仓根 _test_leak_guard.py
+# 已并入 tests/，由编排统一发现。
+COPY tests/ ./tests/
+
+# 非 root 运行（P1）：镜像以 uid 10001 的 qoder 用户启动——PID1 与所有写盘
+# （accounts/、usage/、settings.json）都不再是 root。umid 组件只需读+执行，
+# 保持 root 属主（最小权限）；alpine 的 /tmp 是 1777，python 临时文件无碍。
+RUN adduser -D -u 10001 -H qoder && \
+    mkdir -p /app/accounts /app/usage && \
+    chown -R qoder:qoder /app/accounts /app/usage
+USER 10001
 
 # Volume persistence for credentials and usage logs
 VOLUME ["/app/accounts", "/app/usage"]

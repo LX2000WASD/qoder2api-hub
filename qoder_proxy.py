@@ -34,6 +34,7 @@ import os
 MAX_PAYLOAD_BYTES = int(os.environ.get("QD_MAX_PAYLOAD_BYTES", 50 * 1024 * 1024))  # 50MB limit
 import ipaddress
 import socket
+import signal
 import ssl
 import sys
 import threading
@@ -104,6 +105,34 @@ _FAKEIP_NETS = [
 ]
 
 
+# DNS 解析结果短缓存（连接与线程上限同批的性能项）：
+# validate_public_http_url 原本每请求 getaddrinfo 一次，是热路径上唯一的
+# 系统调用放大。getaddrinfo 不返回 TTL，这里用固定窗口（默认 60s，
+# QD_DNS_CACHE_TTL 覆盖，0 = 关闭），窗口内复用结果；解析失败不缓存
+# （DNS 抖动时行为与改动前逐次重试一致）。**只缓存解析结果**，不触碰
+# urlopen 的 ProxyHandler 语义——HTTPS_PROXY/HTTP_PROXY 环境变量仍由
+# urllib 默认 opener 处理（README 记载的"国际版走代理"依赖于此）。
+_DNS_CACHE_TTL = max(0.0, float(os.environ.get("QD_DNS_CACHE_TTL", "60") or 60))
+_DNS_CACHE = {}
+_DNS_CACHE_LOCK = threading.Lock()
+
+
+def _cached_getaddrinfo(host, port):
+    """getaddrinfo 结果的 TTL 窗口缓存；失败原样抛出且不缓存。"""
+    if _DNS_CACHE_TTL <= 0:
+        return socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    key = (host, port)
+    now = time.time()
+    with _DNS_CACHE_LOCK:
+        hit = _DNS_CACHE.get(key)
+        if hit and hit[1] > now:
+            return hit[0]
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    with _DNS_CACHE_LOCK:
+        _DNS_CACHE[key] = (infos, now + _DNS_CACHE_TTL)
+    return infos
+
+
 def _host_boundary_violation(ip, allow_local):
     """True when the resolved/IP address must be refused."""
     if ip.is_loopback:
@@ -143,7 +172,7 @@ def validate_public_http_url(url, allow_local=False):
         return url
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     try:
-        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        infos = _cached_getaddrinfo(host, port)
     except socket.gaierror as exc:
         raise ValueError("cannot resolve URL host %r: %s" % (host, exc))
     addrs = []
@@ -236,6 +265,19 @@ def install_console_close_handler():
         return None
 
 
+def _safe_server_shutdown(server):
+    """工作线程里调 server.shutdown()：把 serve_forever 循环停下来。
+
+    SIGTERM 处理器本身在主线程里执行，直接调 shutdown() 会死锁
+    （shutdown 阻塞等循环退出，而循环被信号处理器打断着），所以
+    交给本线程。异常一律吞掉——收尾路径不能比主流程更能决定生死。
+    """
+    try:
+        server.shutdown()
+    except Exception:
+        pass
+
+
 CHAT_PATH = ("/algo/api/v2/service/pro/sse/agent_chat_generation"
              "?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1")
 MODELS_PATH = "/algo/api/v2/model/list?Encode=1"
@@ -249,6 +291,56 @@ try:
         BASEPROMPT = json.load(_bp_fh)
 except Exception:
     BASEPROMPT = {}
+
+
+# baseprompt.json 是 build_qoder_body 的请求体骨架（从桌面端抓包而来）。
+# 一旦文件被删/截断/换成别的结构，请求体就会缺字段、上游 400 而本地难定位。
+# 导入期保持静默兜底（测试 import 不能崩）；启动期 fail-fast 校验关键骨架。
+_BASEPROMPT_SKELETON = (
+    # (键, 期望类型, 为什么必须存在)
+    ("chat_task", str, "上游路由依赖的会话类型"),
+    ("model_config", dict, "build_qoder_body 往里写 key/display_name/…"),
+    ("chat_context", dict, "最近用户提示词与模型配置副本挂在这里"),
+    ("parameters", dict, "max_tokens / reasoning_effort 写在这里"),
+    ("messages", list, "system 基座 + 真实会话都在此拼接"),
+    ("tools", list, "客户端工具列表的落点（无工具时置空列表）"),
+    ("business", dict, "会话卡片 id/begin_at/name 写在这里"),
+)
+
+
+def validate_baseprompt_skeleton():
+    """启动期校验 baseprompt.json 骨架：缺关键字段直接报错退出。
+
+    只在启动时查一次，运行期零成本；检测的是"结构不可用"，不是
+    "内容不是最新"——模板内容可以自由演进，骨架字段不能丢。
+    """
+    problems = []
+    if not isinstance(BASEPROMPT, dict) or not BASEPROMPT:
+        problems.append("empty or not a JSON object")
+    else:
+        for key, kind, why in _BASEPROMPT_SKELETON:
+            if key not in BASEPROMPT:
+                problems.append("missing key %r (%s)" % (key, why))
+            elif not isinstance(BASEPROMPT[key], kind):
+                problems.append("key %r must be %s (%s)"
+                                % (key, kind.__name__, why))
+        msgs = BASEPROMPT.get("messages")
+        if isinstance(msgs, list) and msgs and not all(
+                isinstance(m, dict) and m.get("role") for m in msgs):
+            problems.append("'messages' entries must be dicts carrying a 'role'")
+    if problems:
+        print()
+        print("  [ERROR] baseprompt.json skeleton is broken - refusing to start:")
+        print("          %s" % BASEPROMPT_PATH)
+        for p in problems:
+            print("          - %s" % p)
+        print("          the file is the upstream request-body template;")
+        print("          restore it from git (qoder_proxy.py cannot work")
+        print("          without it).")
+        print()
+        raise SystemExit(1)
+    return True
+
 
 NOISE_KEYS = ("extra_fields", "refusal", "reasoning_content")
 
@@ -364,6 +456,35 @@ def identify_key(supplied):
     return qoder_settings.match_api_key(ACCOUNTS_DIR, supplied, extra_keys=extra)
 
 
+def _allow_key_query():
+    """?key= 兜底鉴权默认关闭（明文 key 经 URL 泄漏面太大）。
+
+    需要浏览器无头打开看板（跨设备）时用 QD_ALLOW_KEY_QUERY=1 打开。
+    """
+    return _env_flag("QD_ALLOW_KEY_QUERY")
+
+
+def _masked_key(key):
+    """stdout 展示用的 key 脱敏：前缀 + sha256 短摘要（绝不明文整串）。"""
+    if not key:
+        return "(none)"
+    key = str(key)
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    if len(key) <= 10:
+        return "%s...%s" % (key[:3], digest[:6])
+    return "%s...%s" % (key[:8], digest[:8])
+
+
+def _reveal_keys_allowed():
+    """明文打印 key 的两个白名单：交互式终端 或 QD_REVEAL_KEYS=1。"""
+    if _env_flag("QD_REVEAL_KEYS"):
+        return True
+    try:
+        return bool(sys.stdout.isatty())
+    except Exception:
+        return False
+
+
 def _empty_stats():
     return {"requests": 0, "errors": 0, "prompt_tokens": 0,
             "completion_tokens": 0, "reasoning_tokens": 0, "cached_tokens": 0,
@@ -376,6 +497,19 @@ def _empty_stats():
 
 
 _usage = _empty_stats()
+
+# 汇总落盘的批量策略（写放大治理）：
+#   - JSONL 行仍**逐请求追加**（审计账目，丢一行就是丢一条账）；
+#   - 内存累加不再每请求 json.loads(json.dumps(_usage)) 全量深拷贝
+#     （拷贝量随 by_model 条目数线性放大，纯 CPU 浪费）；
+#   - 汇总文件改批量重写：每 N 行或 T 秒落一次，退出时强刷
+#     （见 flush_usage_summary 与 main() 的关闭钩子）。
+_USAGE_FLUSH_ROWS = max(1, int(os.environ.get("QD_USAGE_FLUSH_ROWS", "50") or 50))
+_USAGE_FLUSH_SECS = max(1.0, float(os.environ.get("QD_USAGE_FLUSH_SECS", "300") or 300))
+_USAGE_FLUSH_LOCK = threading.Lock()
+_usage_dirty_rows = 0
+_usage_last_flush_at = time.time()
+_usage_flusher_started = False
 
 
 def _extract_usage(usage):
@@ -443,6 +577,7 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
       key_id            API key 的**标识**（panel id / legacy / launcher），不涉明文
     请求档位与实际档位同时落盘，才能看出归一化有没有把它们改掉/丢掉。
     """
+    global _usage_dirty_rows
     fields = _extract_usage(usage)
     if not fields:
         return None
@@ -501,8 +636,9 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
         for k in USAGE_FIELDS:
             if k in fields:
                 per[k] += fields[k]
-        summary = json.loads(json.dumps(_usage))
-    _persist_usage(row, summary, "usage persist failed")
+        _usage_dirty_rows += 1
+    _persist_usage(row, None, "usage persist failed")
+    _maybe_flush_usage_summary()
     try:
         t_tokens = fields.get("total_tokens", 0)
         dur = " %dms" % elapsed_ms if elapsed_ms is not None else ""
@@ -517,12 +653,16 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
     return row
 
 
-def _persist_usage(row, summary, fail_label):
-    """Append one JSONL row and atomically rewrite the summary.
+def _persist_usage(row, summary=None, fail_label="usage persist failed"):
+    """Append one JSONL row; rewrite the summary atomically when given one.
 
     The temp file carries a unique suffix: two threads writing the same
     "<summary>.tmp" race, and the loser's os.replace() fails with ENOENT
     because the winner already renamed the file away.
+
+    summary=None 时只追加 JSONL 行——汇总重写已从热路径上摘掉，交给
+    批量路径 _flush_usage_summary（每 N 行 / T 秒 + 退出强刷），避免
+    每请求一次全量重写。
     """
     try:
         usage_dir = Path(USAGE_DIR).resolve()
@@ -534,27 +674,110 @@ def _persist_usage(row, summary, fail_label):
             raise ValueError("usage path escapes base directory")
         with open(log_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-        tmp_summary = usage_dir / (
-            os.path.basename(USAGE_SUMMARY)
-            + ".%d.%d.tmp" % (os.getpid(), threading.get_ident()))
-        if not tmp_summary.is_relative_to(usage_dir):
-            raise ValueError("usage path escapes base directory")
-        try:
-            tmp_summary.write_text(json.dumps(summary, ensure_ascii=False,
-                                              indent=2), encoding="utf-8")
-            os.replace(tmp_summary, summary_path)
-        except Exception:
-            try:
-                os.unlink(tmp_summary)
-            except Exception:
-                pass
-            raise
+        if summary is None:
+            return
+        _write_usage_summary(summary, usage_dir, summary_path)
     except Exception as exc:
         log("%s: %s" % (fail_label, exc))
 
 
+def _write_usage_summary(summary, usage_dir, summary_path):
+    """原子重写汇总文件（唯一后缀 tmp + os.replace）。"""
+    tmp_summary = usage_dir / (
+        os.path.basename(USAGE_SUMMARY)
+        + ".%d.%d.tmp" % (os.getpid(), threading.get_ident()))
+    if not tmp_summary.is_relative_to(usage_dir):
+        raise ValueError("usage path escapes base directory")
+    try:
+        tmp_summary.write_text(json.dumps(summary, ensure_ascii=False,
+                                          indent=2), encoding="utf-8")
+        os.replace(tmp_summary, summary_path)
+    except Exception:
+        try:
+            os.unlink(tmp_summary)
+        except Exception:
+            pass
+        raise
+
+
+def _usage_snapshot():
+    """轻量快照：顶层浅拷贝 + by_model 逐模型浅拷贝。
+
+    替代旧路径每请求一次的 json.loads(json.dumps(_usage))：拷贝量曾随
+    by_model 条目数线性放大。参与拷贝的值全是标量，JSON 输出与深拷贝
+    逐位一致。
+    """
+    with _lock:
+        snap = dict(_usage)
+        snap["by_model"] = {k: dict(v) for k, v in _usage["by_model"].items()}
+    return snap
+
+
+def _maybe_flush_usage_summary():
+    """请求线程顺带判断：攒够 N 行或跨过 T 秒就落一次汇总。"""
+    with _lock:
+        due = (_usage_dirty_rows >= _USAGE_FLUSH_ROWS
+               or (time.time() - _usage_last_flush_at) >= _USAGE_FLUSH_SECS)
+    if due:
+        _flush_usage_summary()
+
+
+def _flush_usage_summary():
+    """重写一次汇总文件（有未落盘计数才写；并发由 _USAGE_FLUSH_LOCK 串行）。"""
+    global _usage_dirty_rows, _usage_last_flush_at
+    with _USAGE_FLUSH_LOCK:
+        with _lock:
+            if _usage_dirty_rows <= 0:
+                return
+        summary = _usage_snapshot()
+        try:
+            usage_dir = Path(USAGE_DIR).resolve()
+            usage_dir.mkdir(parents=True, exist_ok=True)
+            summary_path = usage_dir / os.path.basename(USAGE_SUMMARY)
+            if not summary_path.is_relative_to(usage_dir):
+                raise ValueError("usage path escapes base directory")
+            _write_usage_summary(summary, usage_dir, summary_path)
+        except Exception as exc:
+            log("usage summary flush failed: %s" % exc)
+            return
+        with _lock:
+            _usage_dirty_rows = 0
+            _usage_last_flush_at = time.time()
+
+
+def flush_usage_summary():
+    """关闭钩子：把内存里未落盘的计数强刷进汇总文件。"""
+    with _lock:
+        if _usage_dirty_rows <= 0:
+            return
+    _flush_usage_summary()
+
+
+def _start_usage_flusher():
+    """后台低频刷新：请求断流后 T 秒窗口内仍能把汇总落盘，不靠下一请求。
+
+    只启动一次、daemon 线程随进程退出（main 调；测试不经 main）。
+    """
+    global _usage_flusher_started
+    if _usage_flusher_started:
+        return
+    _usage_flusher_started = True
+
+    def _loop():
+        while True:
+            time.sleep(_USAGE_FLUSH_SECS)
+            try:
+                _flush_usage_summary()
+            except Exception:
+                pass
+
+    threading.Thread(target=_loop, name="qd-usage-flusher",
+                     daemon=True).start()
+
+
 def record_error(model, status, message, elapsed_ms=None):
     """Count a failed request and append it to the log so errors are visible."""
+    global _usage_dirty_rows
     row = {
         "at": time.time(),
         "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -570,8 +793,9 @@ def record_error(model, status, message, elapsed_ms=None):
         if elapsed_ms is not None:
             _usage["wall_ms_sum"] += elapsed_ms
             _usage["wall_samples"] += 1
-        summary = json.loads(json.dumps(_usage))
-    _persist_usage(row, summary, "error persist failed")
+        _usage_dirty_rows += 1
+    _persist_usage(row, None, "error persist failed")
+    _maybe_flush_usage_summary()
     dur = " %dms" % elapsed_ms if elapsed_ms is not None else ""
     log("request error: model=%s%s status=%s msg=%s"
         % (model, dur, status, str(message)[:360]),
@@ -1595,6 +1819,31 @@ def current_account():
     return POOL.representative() if POOL else None
 
 
+def _pool_ready_count():
+    """池中就绪账号数（/readyz 与 /health 的判定同源）。
+
+    防御式：POOL 可能为 None（纯库使用/测试），或被测试桩替换成没有
+    count_ready 的对象——此时按 0 计，就绪探针返回 503（保守，不抛异常）。
+    """
+    try:
+        return int(POOL.count_ready() or 0) if POOL else 0
+    except Exception:
+        return 0
+
+
+def _pool_cooling_count():
+    """处于冷却的账号数（/metrics 观测用，就绪的反面不必然等于它）。"""
+    try:
+        if not POOL or not getattr(POOL, "accounts", None):
+            return 0
+        now = time.time()
+        return sum(1 for a in POOL.accounts
+                   if getattr(a, "cooldown_until", 0.0)
+                   and float(a.cooldown_until or 0.0) > now)
+    except Exception:
+        return 0
+
+
 # ---------------------------------------------------------------------------
 # 前缀会话亲和（同一对话固定同一账号，命中上游按账号的 prompt 缓存）
 # ---------------------------------------------------------------------------
@@ -1663,6 +1912,16 @@ def prompt_fingerprint(messages):
 LOG_BUFFER = deque(maxlen=2000)
 _LOG_LOCK = threading.Lock()
 _LOG_COUNTER = 0
+# stdout 单行写锁：多线程并发 log() 时避免 JSON 行/人类行交错半行。
+_LOG_WRITE_LOCK = threading.Lock()
+
+
+def _env_flag(name):
+    """env 开关归一：1/true/yes/on（大小写不敏感）为开。"""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+_LOG_JSON = _env_flag("QD_LOG_JSON")
 
 
 def add_log_entry(msg, level=None, tag=None):
@@ -1715,9 +1974,24 @@ def add_log_entry(msg, level=None, tag=None):
 
 
 def log(msg, level=None, tag=None):
-    sys.stderr.write("[qd-proxy] %s %s\n" % (time.strftime("%H:%M:%S"), msg))
-    sys.stderr.flush()
-    add_log_entry(msg, level=level, tag=tag)
+    """记一行日志。默认人类格式（stderr）；QD_LOG_JSON=1 时 stdout 输出
+    结构化 JSON 行（ts/level/msg/tag/id，机器可读），采集器直接解析。
+
+    两种格式共用同一份 LOG_BUFFER（面板 /logs 读的就是它）。
+    """
+    entry = add_log_entry(msg, level=level, tag=tag)
+    if _LOG_JSON:
+        # stdout 给采集器（单行 JSON），stderr 不再重复。
+        line = json.dumps({"ts": entry["ts"], "level": entry["level"],
+                           "tag": entry["tag"], "msg": entry["msg"],
+                           "id": entry["id"]}, ensure_ascii=False)
+        with _LOG_WRITE_LOCK:
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+        return
+    with _LOG_WRITE_LOCK:
+        sys.stderr.write("[qd-proxy] %s %s\n" % (entry["time"], msg))
+        sys.stderr.flush()
 
 
 def get_logs(limit=200, level="", tag="", search="", since_id=0):
@@ -4252,6 +4526,13 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
         % realm)
 
 
+# SSE 读线程→主线程队列的容量上限（背压）：
+# 无界队列时，一个慢客户端会让上游全速把数据灌进内存。有界后主线程
+# 消费慢 → reader 阻塞在 put → 背压传导到上游（这是特性不是死锁：
+# reader 是 daemon 线程，连接关闭后随进程退出，不会把主线程卡住）。
+_SSE_QUEUE_MAXSIZE = max(1, int(os.environ.get("QD_SSE_QUEUE_SIZE", "16") or 16))
+
+
 def sse_with_heartbeat(source, send, interval=None, idle_limit=None):
     """在等待上游数据的空档里发送 SSE 注释心跳（`: ping`），并原样转发数据。
 
@@ -4263,7 +4544,10 @@ def sse_with_heartbeat(source, send, interval=None, idle_limit=None):
     source     : 上游数据迭代器（iter_inner_sse 的输出，产出 bytes）
     send       : 发送函数（接收 bytes）
     interval   : 空闲多久发一次心跳（秒），默认 5（可用 QD_SSE_HEARTBEAT 覆盖）
-    idle_limit : 单次等待上限（秒），默认 900；超过抛 TimeoutError
+    idle_limit : 单次等待上限（秒），默认 300（QD_SSE_IDLE_LIMIT 覆盖）；
+                 超过抛 TimeoutError。**必须低于 urlopen 的读超时**（上游
+                 打开处为 600s）：否则 urlopen 的 socket.timeout 会先抛穿，
+                 客户端拿到无错误标记的截断流。
 
     读线程把上游数据放入队列，主线程只在“队列空闲”时补心跳，保证顺序与
     错误传播（上游异常原样在主线程抛出）。
@@ -4279,12 +4563,15 @@ def sse_with_heartbeat(source, send, interval=None, idle_limit=None):
             yield item
         return
     if idle_limit is None:
-        idle_limit = 900.0
+        try:
+            idle_limit = float(os.environ.get("QD_SSE_IDLE_LIMIT", "300") or 300)
+        except (TypeError, ValueError):
+            idle_limit = 300.0
 
     import queue as _queue
     import threading as _threading
 
-    box = _queue.Queue()
+    box = _queue.Queue(maxsize=_SSE_QUEUE_MAXSIZE)   # 有界队列：背压上传导
     done = object()
 
     def _reader():
@@ -5477,8 +5764,110 @@ def _responses_failed_frame(holder, code, message):
 # ---------------------------------------------------------------------------
 # HTTP layer
 # ---------------------------------------------------------------------------
+class QoderHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer + 活跃连接数上限与优雅排空。
+
+    每条连接独占一个线程（流式请求还要再加读线程），没有上限时看板
+    高频轮询叠加慢客户端就能把线程数顶到上千。超过上限的新连接直接
+    收到 503（而不是排队等线程），客户端按常规退避重试即可。
+    """
+    max_active_connections = max(8, int(os.environ.get("QD_MAX_CONNECTIONS",
+                                                       "256") or 256))
+
+    def __init__(self, server_address, RequestHandlerClass):
+        ThreadingHTTPServer.__init__(self, server_address, RequestHandlerClass)
+        self._active_connections = 0
+        self._conn_lock = threading.Lock()
+        self._live_sockets = set()
+
+    def active_connections(self):
+        with self._conn_lock:
+            return self._active_connections
+
+    def process_request(self, request, client_address):
+        with self._conn_lock:
+            if self._active_connections >= self.max_active_connections:
+                over = True
+            else:
+                self._active_connections += 1
+                over = False
+        if over:
+            try:
+                _reject_overloaded_connection(request)
+            finally:
+                try:
+                    request.close()
+                except Exception:
+                    pass
+            return
+        with self._conn_lock:
+            self._live_sockets.add(request)
+        ThreadingHTTPServer.process_request(self, request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            try:
+                self.finish_request(request, client_address)
+                self.shutdown_request(request)
+            except Exception:
+                self.handle_error(request, client_address)
+                self.shutdown_request(request)
+        finally:
+            with self._conn_lock:
+                self._active_connections -= 1
+                self._live_sockets.discard(request)
+
+    def nudge_idle_connections(self):
+        """把卡在“读下一个请求行”的空闲 keep-alive 连接立即唤醒。
+
+        对已接受的 socket 调 shutdown(SHUT_RD)：对端没发数据时，服务端
+        阻塞的 recv 立刻返回 EOF，handle_one_request 据此关闭连接——
+        进程关闭因此不必为空闲连接空等整个优雅期。进行中的响应不受
+        影响（只动了读路径，写路径完好），优雅时间留给真正的在途请求。
+        """
+        with self._conn_lock:
+            sockets = list(self._live_sockets)
+        for sock in sockets:
+            try:
+                sock.shutdown(socket.SHUT_RD)
+            except Exception:
+                pass
+
+    def wait_connections_drained(self, timeout=10.0):
+        """优雅排空：等活跃连接归零或 timeout 到期（SIGTERM 优雅期）。"""
+        deadline = time.time() + max(0.0, float(timeout))
+        while True:
+            with self._conn_lock:
+                remaining = self._active_connections
+            if remaining <= 0:
+                return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.05)
+
+
+def _reject_overloaded_connection(request):
+    """超上限连接的越界应答：不经 Handler 线程，裸写一个完整响应即关。"""
+    body = json.dumps({"error": {
+        "message": "server busy: too many active connections, retry later",
+        "type": "server_error", "code": 503}}, ensure_ascii=False).encode("utf-8")
+    head = ("HTTP/1.1 503 Service Unavailable\r\n"
+            "Content-Type: application/json; charset=utf-8\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n\r\n" % len(body)).encode("ascii")
+    try:
+        request.sendall(head + body)
+    except Exception:
+        pass
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # 空闲连接 120s 断开（QD_CONNECTION_TIMEOUT 可覆盖）：原来 timeout=None
+    # 意味着一条不发送数据的连接能永远占着一个线程。设了 socket 超时后，
+    # handle_one_request 内部捕获 socket.timeout 并关连接（对活动中的
+    # 请求/流不产生影响——它们一直在读写）。
+    timeout = max(5, int(os.environ.get("QD_CONNECTION_TIMEOUT", "120") or 120))
     # Which configured API key the caller used, set by _key_ok(). Its bound
     # realm decides the upstream exit for this request alone.
     key_entry = None
@@ -5486,13 +5875,15 @@ class Handler(BaseHTTPRequestHandler):
     def handle(self):
         try:
             super(Handler, self).handle()
-        except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+        except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError,
+                socket.timeout, TimeoutError):
             pass
 
     def finish(self):
         try:
             super(Handler, self).finish()
-        except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+        except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError,
+                socket.timeout, TimeoutError):
             pass
 
     server_version = "qd-proxy/" + VERSION
@@ -5574,6 +5965,62 @@ class Handler(BaseHTTPRequestHandler):
         self._json(code, {"error": {"message": message, "type": err_type,
                                     "code": code}})
 
+    def _prometheus_metrics(self):
+        """/metrics：Prometheus 文本格式（账号池 / 上游错误 / 线程 / usage 概要）。
+
+        只追加观测面，不改任何既有路由。单进程内存口径（与 /health 的
+        accounts_ready 同源）；counter 类指标由采集器自行累积速率。
+        """
+        lines = []
+
+        def metric(name, kind, value, help_text):
+            lines.append("# HELP %s %s" % (name, help_text))
+            lines.append("# TYPE %s %s" % (name, kind))
+            lines.append("%s %s" % (name, value))
+
+        try:
+            total_accounts = len(POOL.accounts) if POOL else 0
+        except Exception:
+            total_accounts = 0
+        metric("qoder_accounts_total", "gauge", total_accounts,
+               "Total accounts in the pool")
+        metric("qoder_accounts_ready", "gauge", _pool_ready_count(),
+               "Accounts currently able to serve")
+        metric("qoder_accounts_cooling", "gauge", _pool_cooling_count(),
+               "Accounts in cooldown")
+        with _lock:
+            errors = int(_usage["errors"] or 0)
+            requests = int(_usage["requests"] or 0)
+            prompt_tokens = int(_usage["prompt_tokens"] or 0)
+            completion_tokens = int(_usage["completion_tokens"] or 0)
+            total_tokens = int(_usage["total_tokens"] or 0)
+        metric("qoder_upstream_errors_total", "counter", errors,
+               "Failed upstream requests since process start")
+        metric("qoder_requests_total", "counter", requests,
+               "Requests recorded since process start")
+        metric("qoder_prompt_tokens_total", "counter", prompt_tokens,
+               "Prompt tokens served since process start")
+        metric("qoder_completion_tokens_total", "counter", completion_tokens,
+               "Completion tokens served since process start")
+        metric("qoder_total_tokens_total", "counter", total_tokens,
+               "All tokens (in+out) since process start")
+        metric("qoder_active_threads", "gauge", threading.active_count(),
+               "Live threads in this process")
+        active_conn = getattr(self.server, "active_connections", None)
+        if callable(active_conn):
+            metric("qoder_active_connections", "gauge", int(active_conn()),
+                   "Open client connections (cap: QD_MAX_CONNECTIONS)")
+        body = ("\n".join(lines) + "\n").encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type",
+                         "text/plain; version=0.0.4; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        if cors_origin_allowed(self.path):
+            self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _rate_limited(self, exc):
         """429 with Retry-After, so clients back off instead of hammering."""
         wait = max(1, int(getattr(exc, "wait", 60) or 60))
@@ -5628,7 +6075,11 @@ class Handler(BaseHTTPRequestHandler):
         anthropic_key = (self.headers.get("x-api-key") or "").strip()
         if anthropic_key:
             return anthropic_key
-        # 浏览器顶层导航无法设置头，所以 ?key= 也接受（看板跨设备打开用）。
+        # 浏览器顶层导航无法设置头，?key= 因此曾被接受；但明文 key 会留在
+        # 浏览器历史、Referer 与反代访问日志里——默认关闭，需要跨设备开看板
+        # 时用 QD_ALLOW_KEY_QUERY=1 显式放开（保留旧用法，不静默兼容）。
+        if not _allow_key_query():
+            return ""
         try:
             query = parse_qs(urlparse(self.path).query)
             return (query.get("key") or [""])[0].strip()
@@ -5637,6 +6088,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _key_ok(self):
         """True when the request carries a right key (or no key is needed)."""
+        # 先清掉上一请求的归属：key_entry 是**连接级**残留状态（keep-alive
+        # 下同一个 Handler 实例处理多条请求），面板分支早返回时若不清，
+        # 本条面板请求的 realm 归属与 usage key_id 会串到上一个 API key。
+        self.key_entry = None
         # 面板会话同时解锁管理 API，浏览器无需在 localStorage 存 API key。
         if self._panel_ok():
             return True
@@ -5798,6 +6253,12 @@ class Handler(BaseHTTPRequestHandler):
             # 极简探活端点：**不需要面板密码/API Key、不查账号池**。
             # 客户端/守护脚本常用 GET /ping 判活，之前返回 404 会被判成
             # “网关不可用” → 反复重连。这里返回纯文本 pong。
+            if path == "/readyz" and _pool_ready_count() <= 0:
+                # /readyz 是就绪探针（例外）：一个就绪账号都没有时返 503，
+                # 让 docker/k8s 摘流；liveness（/ping /livez /healthz）仍
+                # 返纯 pong——“活着但不能服务”与“死了”必须区分开。
+                return self._error(503, "no ready account in the pool",
+                                   "server_error")
             body = b"pong\n"
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -5827,13 +6288,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(500, "vm status failed: %s" % exc)
         if path == "/health":
             rep = current_account()
+            # ok 接真实判定：池里没有就绪账号时 False（原为硬编码 True，
+            # 编排层无法据此摘流）。其余字段不变，JSON 契约只增不删。
+            ready = _pool_ready_count()
             info = {
-                "ok": True,
+                "ok": ready > 0,
                 "service": "qoder-proxy",
                 "version": VERSION,
                 "realm": CURRENT_REALM,
                 "accounts": len(POOL.accounts) if POOL else 0,
-                "accounts_ready": POOL.count_ready() if POOL else 0,
+                "accounts_ready": ready,
+                "accounts_cooling": _pool_cooling_count(),
+                "corrupt_count": getattr(POOL, "corrupt_count", 0) if POOL else 0,
+                "corrupt_files": getattr(POOL, "corrupt_files", []) if POOL else [],
                 "api_key_required": bool(API_KEY),
             }
             if self._key_ok():
@@ -5846,6 +6313,11 @@ class Handler(BaseHTTPRequestHandler):
                     "expires_at": rep.expires_at if rep else None,
                 })
             return self._json(200, info)
+        if path == "/metrics":
+            # Prometheus 文本格式（新增路由，既有路由一律不动）：
+            # 与 /health 同级开放（不查面板密码/API Key），采集器零配置
+            # 直连；要加认证在反代层挡即可。
+            return self._prometheus_metrics()
         if path == "/realm":
             return self._json(200, {"current": CURRENT_REALM,
                                     "options": ["intl", "cn"]})
@@ -7141,6 +7613,30 @@ class Handler(BaseHTTPRequestHandler):
                                 continue
                             pump_exc = exc
                             break
+                        except Exception as exc:
+                            # 兜底收尾（socket.timeout / 未归类的读写异常）：
+                            # 之前这类异常会抛穿 do_POST，客户端拿到**无错误
+                            # 标记的截断流**（chunked 没收尾就断）。这里仿
+                            # pump_exc 路径补 data:{error} + [DONE] 再终止流，
+                            # 并记一笔 error 行便于排障。（心跳的 idle_limit
+                            # 已低于 urlopen 超时，正常情况先由它抛，此处是
+                            # 最后防线。）
+                            wall = int((time.time() - t_start) * 1000)
+                            record_error(model, 500,
+                                         "stream aborted: %s" % exc,
+                                         elapsed_ms=wall)
+                            _err = json.dumps({"error": {
+                                "message": "upstream stream aborted: %s" % exc,
+                                "type": "server_error", "code": 500}},
+                                ensure_ascii=False)
+                            try:
+                                self._sse_write(("data: %s\n\n"
+                                                 % _err).encode("utf-8"))
+                                self._sse_write(b"data: [DONE]\n\n")
+                            except Exception:
+                                pass
+                            self._sse_end()
+                            return
                 finally:
                     if cur is not upstream:
                         try:
@@ -7252,6 +7748,10 @@ def main():
                          "admin)")
     args = ap.parse_args()
 
+    # 启动期 fail-fast：baseprompt 骨架坏了就不要往下走（运行中缺骨架
+    # 的请求体只会被上游 400 回来，排障代价极高）。
+    validate_baseprompt_skeleton()
+
     if args.lan and args.host == "127.0.0.1":
         args.host = "0.0.0.0"
     if args.usage_dir:
@@ -7342,6 +7842,8 @@ def main():
     from qoder_scheduler import Scheduler
     SCHEDULER = Scheduler(POOL)
     SCHEDULER.start()
+    # usage 汇总的定时落盘（T 秒窗口；退出时还有 flush_usage_summary 兜底）
+    _start_usage_flusher()
 
     if not POOL.accounts:
         # 永不静默采用本机客户端登录：先报告扫描结果，由用户在看板确认导入。
@@ -7388,15 +7890,25 @@ def main():
             print("    API       : http://%s:%s/v1" % (ip, args.port))
             print("    Dashboard : http://%s:%s/" % (ip, args.port))
         print()
-        print("    API Key   : %s" % API_KEY)
+        # 明文 key 只在交互式终端（本地 .bat 启动）或 QD_REVEAL_KEYS=1 时
+        # 打印；否则只给前缀+sha256 摘要（容器/服务托管下 stdout 会被日志
+        # 系统长期保存，明文 key 不该落盘）。
+        _key_shown = API_KEY if _reveal_keys_allowed() else _masked_key(API_KEY)
+        print("    API Key   : %s" % _key_shown)
         if API_KEY_GENERATED:
             print("                (newly generated & saved to "
                   "accounts/settings.json)")
         else:
             print("                (reused from accounts/settings.json)")
         print()
-        print("    Open the dashboard (key already included):")
-        print("      http://%s:%s/?key=%s" % (ips[0], args.port, API_KEY))
+        if _allow_key_query() and _reveal_keys_allowed():
+            print("    Open the dashboard (key already included):")
+            print("      http://%s:%s/?key=%s" % (ips[0], args.port, API_KEY))
+        else:
+            # ?key= 兜底默认关闭（QD_ALLOW_KEY_QUERY=1 才放开），自动拼接
+            # 的带 key 登录 URL 不再默认打印。
+            print("    Open the dashboard (paste the key when asked):")
+            print("      http://%s:%s/" % (ips[0], args.port))
         print()
         print("    Clients: Base URL = the API address above, then paste "
               "the key.")
@@ -7422,7 +7934,8 @@ def main():
         sys.stdout.flush()
 
     try:
-        server = ThreadingHTTPServer((args.host, args.port), Handler)
+        # QoderHTTPServer：活跃连接数上限（超限 503）+ 优雅排空接口。
+        server = QoderHTTPServer((args.host, args.port), Handler)
     except OSError as exc:
         # bind 前探测与 bind 之间端口被抢，或被不答 /health 的程序占着
         print()
@@ -7443,15 +7956,70 @@ def main():
     # 进程生命周期内保持 handler 引用：SetConsoleCtrlHandler 存的是裸指针，
     # 回调被 GC 会在关窗时崩溃。
     _ctrl_handler = install_console_close_handler()
+    # SIGTERM 优雅退出（docker stop / systemd 的默认信号）。
+    # 不能在信号处理器里直接调 server.shutdown()：它要阻塞到
+    # serve_forever 循环注意到关闭请求，而信号处理器正打断着主线程 ——
+    # 那是死锁。独立线程调，主线程从 serve_forever 正常返回后走 finally。
+    _shutdown_requested = {"flag": False}
+
+    def _on_sigterm(signum, frame):
+        if _shutdown_requested["flag"]:
+            return          # 重复 SIGTERM：不重复触发
+        _shutdown_requested["flag"] = True
+        log("SIGTERM received: stopping listener, draining in-flight requests",
+            level="WARN", tag="system")
+        threading.Thread(target=_safe_server_shutdown, args=(server,),
+                         name="qd-sigterm", daemon=True).start()
+
+    if os.name == "posix" and hasattr(signal, "SIGTERM"):
+        try:
+            signal.signal(signal.SIGTERM, _on_sigterm)
+        except (ValueError, OSError, RuntimeError):
+            pass            # 非主线程等极端情况：不拦启动
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        log("bye")
+        pass                # Ctrl+C：与 SIGTERM 同一套收尾
     finally:
+        # 1) 停调度器（先停周期性外部副作用）
+        try:
+            if SCHEDULER is not None:
+                SCHEDULER.stop()
+        except Exception as exc:
+            log("scheduler stop failed: %s" % exc, level="WARN")
+        # 2) 强刷 usage 汇总（批量落盘的兜底，见 record_usage）
+        try:
+            flush_usage_summary()
+        except Exception as exc:
+            log("usage summary flush failed: %s" % exc, level="WARN")
+        # 3) 先唤醒空闲 keep-alive 连接（EOF），再把优雅时间全部留给
+        #    真正在途的请求（docker stop 默认 10s 后 SIGKILL，别空等）。
+        try:
+            server.nudge_idle_connections()
+        except Exception:
+            pass
+        # 4) 优雅期：docker stop 默认 10s 后 SIGKILL；QD_SHUTDOWN_GRACE 可调。
+        try:
+            _grace = float(os.environ.get("QD_SHUTDOWN_GRACE", "10") or 10)
+        except (TypeError, ValueError):
+            _grace = 10.0
+        try:
+            _drained = server.wait_connections_drained(_grace)
+        except Exception:
+            _drained = True
+        if not _drained:
+            try:
+                _left = server.active_connections()
+            except Exception:
+                _left = -1
+            log("grace period over: %d connection(s) still active, closing"
+                % _left, level="WARN")
+        # 5) 关监听 socket
         try:
             server.server_close()
         except Exception:
             pass
+        log("bye")
 
 
 if __name__ == "__main__":

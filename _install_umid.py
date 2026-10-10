@@ -46,6 +46,9 @@ package/bundle/qoder-worker-runtime.mjs 内嵌多个平台的原生组件，以�
     python _install_umid.py                                # 当前平台（win32 只提示）
     python _install_umid.py --platform linux --arch x64    # 为 WSL / Docker 提取
     python _install_umid.py --platform linux --dry-run     # 只识别不落盘（仍会下载）
+    python _install_umid.py --platform linux --version 1.1.65  # 锁定版本（镜像可复现）
+
+    docker build --build-arg QODERCLI_VERSION=1.1.65 .     # Dockerfile 侧的锁定入口
 """
 
 import argparse
@@ -235,18 +238,27 @@ def default_dest_dir():
 # ---------------------------------------------------------------------------
 # 网络 / 解包 / 落盘（main 流程用；单测时 stub 这些即可完全离线）
 # ---------------------------------------------------------------------------
-def resolve_tarball(registry_url=REGISTRY_URL, timeout=60.0):
-    """读 npm 元数据 -> (version, tarball_url, integrity)。"""
+def resolve_tarball(registry_url=REGISTRY_URL, version="latest", timeout=60.0):
+    """读 npm 元数据 -> (version, tarball_url, integrity)。
+
+    version="latest"（默认）取 dist-tags.latest，随上游发版漂移；传具体版本号
+    则锁定它——Dockerfile 的 ARG QODERCLI_VERSION 走这条路，把「今天构建的
+    镜像里 umid 来自哪个 qodercli」钉死，保证镜像可复现（sha512 integrity
+    校验照常跑，篡改/损坏仍然中止）。
+    """
     req = urllib.request.Request(registry_url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         meta = json.load(resp)
-    version = str((meta.get("dist-tags") or {}).get("latest") or "")
-    entry = (meta.get("versions") or {}).get(version) or {}
+    if version and version != "latest":
+        resolved = str(version)
+    else:
+        resolved = str((meta.get("dist-tags") or {}).get("latest") or "")
+    entry = (meta.get("versions") or {}).get(resolved) or {}
     dist = entry.get("dist") or {}
     url = str(dist.get("tarball") or "")
     if not url:
-        raise RuntimeError("npm 元数据里没有 dist.tarball（version=%r）" % version)
-    return version, url, str(dist.get("integrity") or "")
+        raise RuntimeError("npm 元数据里没有 dist.tarball（version=%r）" % resolved)
+    return resolved, url, str(dist.get("integrity") or "")
 
 
 def download_tarball(url, timeout=300.0, log=print):
@@ -288,6 +300,20 @@ def extract_runtime_bundle(tgz_bytes):
     raise RuntimeError("tarball 里找不到 %s（上游包结构可能已变化）" % BUNDLE_MEMBER)
 
 
+def record_version(dest_dir, version):
+    """把来源 qodercli 版本写到 <dest_dir>/.qodercli-version（溯源/复现用）。
+
+    与 runtime-info 同目录，镜像里随 COPY --from=umid-builder 一起进 /app/umid，
+    运行时可读；写盘失败不阻断安装（版本记录是辅助信息，不是契约）。
+    """
+    try:
+        marker = os.path.join(dest_dir, ".qodercli-version")
+        with open(marker, "w", encoding="utf-8") as fh:
+            fh.write(str(version or "").strip() + "\n")
+    except OSError:
+        pass
+
+
 def install(data, dest_dir, log=print):
     """原子写入 <dest_dir>/runtime-info 并 chmod 755；返回目标路径。"""
     os.makedirs(dest_dir, exist_ok=True)
@@ -320,6 +346,9 @@ def main(argv=None):
                         help="覆盖已存在且校验通过的目标文件")
     parser.add_argument("--pick", type=int, default=None,
                         help="多候选时手动指定（候选列表下标，见输出清单）")
+    parser.add_argument("--version", default="latest",
+                        help="锁定 @qoder-ai/qodercli 版本（默认 latest=dist-tags.latest；"
+                             "docker build 可用 --build-arg QODERCLI_VERSION=<ver> 钉死）")
     args = parser.parse_args(argv)
 
     plat = (args.platform or "").strip().lower()
@@ -345,7 +374,7 @@ def main(argv=None):
         print("已就绪：现有文件校验通过，跳过下载（--force 可强制重装）。")
         return 0
 
-    version, url, integrity = resolve_tarball()
+    version, url, integrity = resolve_tarball(version=args.version)
     print("npm 包  ：@qoder-ai/qodercli@%s" % version)
     print("下载源  ：%s" % url)
     tgz = download_tarball(url)
@@ -393,7 +422,8 @@ def main(argv=None):
         return 0
 
     path = install(blob, dest_dir)
-    print("完成    ：%s（%d 字节，chmod 755）" % (path, len(blob)))
+    record_version(dest_dir, version)
+    print("完成    ：%s（%d 字节，chmod 755；来源=%s）" % (path, len(blob), version))
     print("下一步  ：qoder_accounts.runtime_info_exe() 会自动发现该组件（POSIX）；")
     print("          机器身份为机器级——同机多账号不能借此各自领取（服务端按设备去重）。")
     return 0

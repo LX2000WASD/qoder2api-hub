@@ -14,8 +14,11 @@ services:
     #    printf '02:42:%02x:%02x:%02x:%02x\n' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256))
     # mac_address: "02:42:ac:11:00:77"
     ports:
-      # 宿主机:容器。改容器监听端口时 PORT 与这里要一起改
-      - "8790:8790"
+      # 默认只发布到本机回环 127.0.0.1：本网关按「Cloudflare Tunnel / 反向代理」
+      # 访问模型设计（见下面 cloudflared 注释骨架），不需要在 LAN/公网开口。
+      # 改回老式 LAN 直连：把下面这行换成 "8790:8790"（等价 0.0.0.0:8790:8790）。
+      # 宿主机端口改时，PORT 与这里一起改。
+      - "127.0.0.1:8790:8790"
     environment:
       # HOST/PORT 真实生效：镜像 CMD 不再硬编码 --host/--port（argparse 读环境变量）
       - HOST=0.0.0.0
@@ -27,9 +30,43 @@ services:
       # NAS / 长期部署建议改成绝对路径，避免源码目录被重装覆盖时连数据一起删掉
       - ./accounts:/app/accounts
       - ./usage:/app/usage
+    # 资源上限（P1）：网关常态占用远低于 1G/2 核，超限被 OOM 杀掉好过把宿主机拖垮。
+    mem_limit: 1g
+    cpus: "2"
+    # 日志体积防线：json-file 单文件 10MB、保留 3 个滚动文件（默认无限增长，
+    # 长期跑的 NAS 会慢慢写满磁盘）。
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # ⚠️ 权限：镜像内以非 root 运行（uid 10001，见 Dockerfile）。上面两个是 bind
+    # 挂载，宿主机目录默认属于你的账号（uid 一般是 1000），首次启动前执行一次：
+    #     sudo chown -R 10001:10001 ./accounts ./usage
+    # （目录不存在时首次 up 会自动创建，chown 对空目录同样安全；不想 chown 也可
+    #  把宿主机目录改成 uid 10001 可写的路径，或在这里加 user: "1000:1000" 覆盖。）
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8790/ping',timeout=3)"]
       interval: 60s
       timeout: 5s
       retries: 3
       start_period: 30s
+
+  # ---------------------------------------------------------------------
+  # Cloudflare Tunnel（**可选骨架，默认不启用**）：隧道出站连接回源，宿主机不需要
+  # 对外开任何端口——上面 ports 收紧到 127.0.0.1 就是给它配的。启用三步：
+  #   1) 取消本段注释，docker compose --profile tunnel up -d
+  #   2) 填入你自己的 tunnel token（Zero Trust 面板 → Networks → Tunnels →
+  #      选中隧道 →「Copy token」；**别照抄占位符**）
+  #   3) 在 Zero Trust 的 Public Hostname 里把回源指向 http://qoder-proxy:8790
+  # ---------------------------------------------------------------------
+  # cloudflared:
+  #   profiles: ["tunnel"]
+  #   image: cloudflare/cloudflared:latest
+  #   container_name: qoder-cloudflared
+  #   restart: unless-stopped
+  #   command: tunnel run
+  #   environment:
+  #     - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN:-REPLACE_WITH_YOUR_TUNNEL_TOKEN}
+  #   depends_on:
+  #     - qoder-proxy

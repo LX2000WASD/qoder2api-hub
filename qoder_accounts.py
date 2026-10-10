@@ -29,6 +29,12 @@ import urllib.request
 from pathlib import Path
 import uuid
 
+# POSIX 跨进程文件锁（Windows 无 fcntl，_NamedFlock 会退化为进程内线程锁）
+try:
+    import fcntl as _fcntl
+except ImportError:                      # pragma: no cover - Windows
+    _fcntl = None
+
 from qoder_fingerprint import (derive_id, generate_request_id,
                                derive_machine_token, derive_machine_type,
                                vm_status)
@@ -84,6 +90,136 @@ LOGIN_TTL_SECONDS = 600
 # 账号文件写入锁（/tasks 并行刷新时多个字段各自 save，必须串行落盘）
 _SAVE_LOCK = threading.Lock()
 DEFAULT_USER_TYPE = "personal_professional_trial"
+
+
+# ---------------------------------------------------------------------------
+# 跨进程文件锁（多实例部署补丁）
+# ---------------------------------------------------------------------------
+# 背景：_SAVE_LOCK 只能串行**本进程**的线程；K8s/多容器场景下多个网关实例
+# 共用同一个 accounts 目录，并发写同一账号的 tmp 中间文件会落出坏 JSON。
+# flock（LOCK_EX）把「读-改-写」在进程之间也串行化；同一进程内同一把锁
+# 按**线程**记账可重入（flock 作用在打开文件描述符上，同描述符重复加锁是
+# 幂等的）；同一进程的**其它线程**走真实 flock —— 与别的进程一样互斥
+# （trigger_now 与正在进行的巡检周期因此能正确看到「忙」）。
+_FLOCKS = {}                    # 锁路径 -> _NamedFlock（进程内全局唯一）
+_FLOCKS_LOCK = threading.Lock()
+
+
+class _NamedFlock(object):
+    """具名文件锁：fcntl.flock 排他锁 + 同线程可重入；Windows 退化为 RLock。
+
+    acquire(blocking=False) 拿不到锁返回 False（不抛异常），调用方据此
+    「跳过本次」而不是死等。
+    """
+
+    def __init__(self, path):
+        self.path = os.path.abspath(path)
+        self._depth = 0
+        self._owner = None
+        self._fh = None
+        self._guard = threading.Lock()
+        if _fcntl is None:               # Windows：进程内线程锁兜底
+            self._tk = threading.RLock()
+        else:
+            self._tk = None
+
+    def acquire(self, blocking=True):
+        ident = threading.get_ident()
+        with self._guard:
+            if self._depth > 0 and self._owner == ident:
+                self._depth += 1                  # 同线程重入：幂等
+                return True
+        if self._tk is not None:
+            got = self._tk.acquire(blocking)
+        else:
+            got = False
+            fh = None
+            try:
+                parent = os.path.dirname(self.path) or "."
+                os.makedirs(parent, exist_ok=True)
+                fh = open(self.path, "a+")
+                if blocking:
+                    _fcntl.flock(fh.fileno(), _fcntl.LOCK_EX)
+                    got = True
+                else:
+                    try:
+                        _fcntl.flock(fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                        got = True
+                    except OSError:
+                        got = False
+            except OSError:
+                got = False
+            if not got:
+                try:
+                    if fh is not None:
+                        fh.close()
+                except OSError:
+                    pass
+            else:
+                with self._guard:
+                    self._fh = fh
+                    self._owner = ident
+                    self._depth = 1
+                return True
+        if got:
+            with self._guard:
+                self._owner = ident
+                self._depth = 1
+        return got
+
+    def held_by_current_thread(self):
+        """当前线程是否已持有这把锁（用于可重入场景的「已在锁内」判定）。"""
+        with self._guard:
+            return self._depth > 0 and self._owner == threading.get_ident()
+
+    def release(self):
+        with self._guard:
+            ident = threading.get_ident()
+            if self._depth <= 0 or self._owner != ident:
+                return
+            self._depth -= 1
+            if self._depth > 0:
+                return
+            fh, self._fh, self._owner = self._fh, None, None
+        if self._tk is not None:
+            try:
+                self._tk.release()
+            except RuntimeError:
+                pass
+            return
+        if fh is not None:
+            try:
+                _fcntl.flock(fh.fileno(), _fcntl.LOCK_UN)
+            except (OSError, AttributeError):
+                pass
+            try:
+                fh.close()
+            except OSError:
+                pass
+
+    def __enter__(self):
+        self.acquire(blocking=True)
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+        return False
+
+
+def _named_flock(path):
+    """同一物理路径共享同一把锁（保证进程内重入记账生效）。"""
+    key = os.path.abspath(path)
+    with _FLOCKS_LOCK:
+        lk = _FLOCKS.get(key)
+        if lk is None:
+            lk = _NamedFlock(key)
+            _FLOCKS[key] = lk
+        return lk
+
+
+def _account_dir_flock(directory):
+    """账号目录的排他锁：<accounts>/.save.lock（Account.save 落盘用）。"""
+    return _named_flock(os.path.join(str(directory), ".save.lock"))
 
 # 业务端点（全部挂 openapi 基址，纯 Bearer，无 COSY 签名）
 PATH_DEVICE_POLL = "/api/v1/deviceToken/poll"
@@ -487,7 +623,9 @@ def _identity_cache_expired_entry_exists(realm, now):
 def _write_identity_cache_doc(doc):
     """原子写缓存文档（临时文件 + os.replace、权限 0600）；失败静默返回 False。"""
     path = machine_identity_cache_path()
-    tmp = path + ".tmp"
+    # tmp 名带 pid+uuid：多实例并发写机器身份缓存时不会互相踩半截文件
+    # （固定 .tmp 名 + 并发 open 是同一类坏 JSON 缺陷）。
+    tmp = "%s.%s.%d.tmp" % (path, uuid.uuid4().hex[:8], os.getpid())
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -867,6 +1005,54 @@ def next_checkin_window(now=None):
     return int(boundary.timestamp()), boundary.strftime("%m-%d %H:%M") + "（UTC+8）"
 
 
+def now_utc8():
+    """当前 UTC+8 时刻（业务时区：签到/日折叠/调度排程统一用它）。
+
+    为什么不用 localtime：官方 compose 设了 TZ=Asia/Shanghai，但 K8s / 裸
+    docker 常漏掉 TZ——容器跑在 UTC 时，按 localtime 排的 09:00 签到实为
+    北京 17:00、日折叠会早于上游 10:00（UTC+8）重置点。统一按 UTC+8 计算
+    后排程/折叠与官方业务窗口一致，与容器 TZ 无关。
+    """
+    return datetime.datetime.now(_UTC8)
+
+
+def today_utc8():
+    """业务日期「今天」（YYYY-MM-DD，UTC+8）。"""
+    return now_utc8().strftime("%Y-%m-%d")
+
+
+_TZ_SKEW_WARNED = False
+
+
+def warn_timezone_skew(force=False):
+    """启动校验：本地时区不是 UTC+8 时 warn 一次（建议 TZ=Asia/Shanghai）。
+
+    时序已统一按 UTC+8 计算（见 now_utc8），此告警只提醒「容器时钟源与
+    业务时区不一致」——漏配 TZ 的容器里，看板上的时间戳/日志时间仍按本地
+    时区渲染，排障时容易对不上。
+    """
+    global _TZ_SKEW_WARNED
+    if _TZ_SKEW_WARNED and not force:
+        return
+    try:
+        offset = datetime.datetime.now().astimezone().utcoffset()
+    except Exception:
+        return
+    if offset is None or offset.total_seconds() == 8 * 3600:
+        _TZ_SKEW_WARNED = True
+        return
+    _TZ_SKEW_WARNED = True
+    try:
+        import sys
+        sys.stderr.write(
+            ("[qoder] 容器本地时区不是 UTC+8（偏移 %s）。业务排程/日折叠已按 "
+             "UTC+8 计算，不受影响；建议设置 TZ=Asia/Shanghai "
+             "让日志时间戳也与业务时钟对齐" + chr(10)) % offset)
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # 账号级预算护栏（task-61）：常量 + 当日用量折叠
 # ---------------------------------------------------------------------------
@@ -943,75 +1129,138 @@ _QUOTA_REFRESHER_PARK = 6 * 3600        # 刷新失败的账号停放 6h（§2.5
 # 生产链路（CreditsRefresher -> refresh_daily_usage()）走 QD_PROXY_USAGE_DIR，
 # 与 qoder_proxy.USAGE_DIR 同源；唯一例外是 proxy 的 --usage-dir（只改 proxy 侧）。
 USAGE_LOG_OVERRIDE = None
+# 折叠时读取的文件数（当天 + 最近 N-1 天）：轮转后单文件即一天数据，3 天
+# 足以覆盖跨午夜/写入滞后的边界行；缺失的文件直接跳过（os.path.isfile）。
+USAGE_FOLD_DAYS = 3
 # 9999-12-31T00:00:00Z：官方给 CN 号的「永不过期」占位值（质检 E4 实测）——
 # 临期权重与 soonest_expiring_days 必须跳过它，否则 CN 号会被算成"很久以后到期"。
 _EXPIRY_NEVER_EPOCH = 253402214400
 
 
+def usage_dir():
+    """usage 目录（与 qoder_proxy.USAGE_DIR 同源约定，路径约定保持不变）。
+
+    QD_PROXY_USAGE_DIR > <repo>/usage（与 qoder_proxy 的默认值一致）。
+    """
+    return os.environ.get("QD_PROXY_USAGE_DIR") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "usage")
+
+
 def usage_log_path():
-    """usage.jsonl 的路径。
+    """旧的单文件 usage.jsonl 路径（兼容读取迁移用）。
 
     优先级：USAGE_LOG_OVERRIDE（显式注入，测试/CLI）> QD_PROXY_USAGE_DIR
     > 本文件目录下的 usage/（与 qoder_proxy 的默认值一致）。
+    轮转后的按天文件见 usage_file_for_day()；本函数保留旧名供迁移期兼容读取，
+    也是 USAGE_LOG_OVERRIDE 注入点。
     """
     if USAGE_LOG_OVERRIDE:
         return str(USAGE_LOG_OVERRIDE)
-    d = os.environ.get("QD_PROXY_USAGE_DIR") or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "usage")
-    return os.path.join(d, "usage.jsonl")
+    return os.path.join(usage_dir(), "usage.jsonl")
+
+
+def usage_file_for_day(day=None, directory=None):
+    """某一天的轮转 usage 文件：usage-YYYYMMDD.jsonl（跨队友契约的统一文件名）。
+
+    写入方（qoder_proxy）负责按天切分；读取方（本模块 fold_daily_usage）
+    只读当天 + 最近 N 天的文件（见 _usage_files_for_fold）。
+    """
+    day = str(day or today_utc8())
+    return os.path.join(directory or usage_dir(), "usage-%s.jsonl" % day)
+
+
+def _day_shift(day, delta_days):
+    """日期字符串加减一天（YYYY-MM-DD）。"""
+    d = datetime.datetime.strptime(str(day), "%Y-%m-%d").date()
+    d += datetime.timedelta(days=int(delta_days))
+    return d.strftime("%Y-%m-%d")
+
+
+def _usage_files_for_fold(day, log_path=None):
+    """折叠时要读的候选文件（**有界**）：
+
+      · 显式 log_path（或 USAGE_LOG_OVERRIDE）-> 只读它（测试注入/CLI）；
+      · 否则读「当天 + 前 N-1 天」的 usage-YYYYMMDD.jsonl（轮转后的新文件，
+        缺失即跳过）+ 旧的 usage.jsonl（迁移期写入方尚未按天切时，当天数据
+        仍落在旧文件里 —— 两者都读才能拼全当天计数）。
+    每个文件里的行最终仍按 iso 日期 == day 过滤，跨天不会串桶。
+    """
+    if log_path:
+        return [str(log_path)]
+    if USAGE_LOG_OVERRIDE:
+        return [str(USAGE_LOG_OVERRIDE)]
+    base = usage_dir()
+    out = []
+    try:
+        days = [_day_shift(day, -i)
+                for i in range(max(1, int(USAGE_FOLD_DAYS)))]
+    except (ValueError, TypeError):
+        # day 不是合法日期：只回退旧文件（与旧行为「全部过滤为空桶」等价，
+        # 不向调用方抛异常——折叠是纯读路径）
+        days = []
+    for d in days:
+        cand = usage_file_for_day(d, directory=base)
+        if os.path.isfile(cand):
+            out.append(cand)
+    legacy = os.path.join(base, "usage.jsonl")
+    if os.path.isfile(legacy):
+        out.append(legacy)
+    return out
 
 
 def fold_daily_usage(log_path=None, day=None, max_lines=200000):
-    """折叠「当日、按 uid」的 token / credit（只读本地 usage.jsonl，**不联网**）。
+    """折叠「当日、按 uid」的 token / credit（只读本地 usage 文件，**不联网**）。
 
     返回 {"day", "tokens"{uid:int}, "credits"{uid:float},
           "model_tokens"{uid:{model:int}}, "rows", "skipped"}。
     · 跨日自动归零：只统计 iso 日期 == day 的行（新的一天 -> 新桶）。
     · 文件缺失/不可读 -> 空桶（不是 None）；调用方据此把「有账号但今日无记录」
       折叠为 0（D4：默认 0 而不是 None，避免当天没流量的号永远 fail-open）。
-    · max_lines 只保留文件末尾 N 行（大日志保护）。
+    · 日期一律按 UTC+8（上游 10:00 重置点所在时区），不再用本地时区。
+    · max_lines 限制**每个文件**保留末尾 N 行（大日志保护）；轮转后单文件
+      本身就是一天的数据，整体扫描量有界。
     """
-    day = day or time.strftime("%Y-%m-%d")
+    day = day or today_utc8()
     out = {"day": day, "tokens": {}, "credits": {}, "model_tokens": {},
            "rows": 0, "skipped": 0}
-    path = log_path or usage_log_path()
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            keep = int(max_lines) if max_lines and int(max_lines) > 0 else None
-            tail = collections.deque(fh, maxlen=keep)
-    except Exception:
-        return out
-    for line in tail:
-        line = line.strip()
-        if not line:
-            continue
+    for path in _usage_files_for_fold(day, log_path):
         try:
-            row = json.loads(line)
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                keep = int(max_lines) if max_lines and int(max_lines) > 0 else None
+                tail = collections.deque(fh, maxlen=keep)
         except Exception:
-            out["skipped"] += 1
             continue
-        if not isinstance(row, dict) or row.get("error"):
-            continue
-        if str(row.get("iso") or "")[:10] != day:
-            continue
-        uid = str(row.get("account") or "")
-        try:
-            tokens = int(row.get("total_tokens") or 0)
-        except (TypeError, ValueError):
-            tokens = 0
-        try:
-            credit = float(row.get("credit") or 0)
-        except (TypeError, ValueError):
-            credit = 0.0
-        out["rows"] += 1
-        if not uid:
-            continue
-        out["tokens"][uid] = out["tokens"].get(uid, 0) + tokens
-        out["credits"][uid] = round(out["credits"].get(uid, 0.0) + credit, 6)
-        model = str(row.get("model") or "")
-        if model:
-            per = out["model_tokens"].setdefault(uid, {})
-            per[model] = per.get(model, 0) + tokens
+        for line in tail:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                out["skipped"] += 1
+                continue
+            if not isinstance(row, dict) or row.get("error"):
+                continue
+            if str(row.get("iso") or "")[:10] != day:
+                continue
+            uid = str(row.get("account") or "")
+            try:
+                tokens = int(row.get("total_tokens") or 0)
+            except (TypeError, ValueError):
+                tokens = 0
+            try:
+                credit = float(row.get("credit") or 0)
+            except (TypeError, ValueError):
+                credit = 0.0
+            out["rows"] += 1
+            if not uid:
+                continue
+            out["tokens"][uid] = out["tokens"].get(uid, 0) + tokens
+            out["credits"][uid] = round(out["credits"].get(uid, 0.0) + credit, 6)
+            model = str(row.get("model") or "")
+            if model:
+                per = out["model_tokens"].setdefault(uid, {})
+                per[model] = per.get(model, 0) + tokens
     return out
 
 
@@ -1124,6 +1373,59 @@ def http_json(url, data=None, method=None, headers=None, timeout=30,
                 log("network retry %d/%d after %s" % (attempt, attempts, exc))
             time.sleep(backoff * attempt)
     raise last
+
+
+# ---------------------------------------------------------------------------
+# 同账号并发刷新的去重（in-flight dedup）
+# ---------------------------------------------------------------------------
+# ready()/调度器/看板接口可能同时发现同一个账号「需要刷新」，若各发各的
+# refresh：① 用户请求被最坏 ≈93s 的超时退避逐个阻塞；② 并发惊群会把同一
+# 个 drt-/jrt- 反复合法化（token 轮换互相踩）。_InFlightRefresh 保证同一账号
+# 同一时刻只有一个 refresh 在飞，后来的调用等同一个结果。
+_REFRESH_GUARDS = {}                 # uid -> _InFlightRefresh
+_REFRESH_GUARDS_LOCK = threading.Lock()
+
+
+class _InFlightRefresh(object):
+    """per-account 刷新闸：leader 执行，waiter 等同一个结果。"""
+
+    def __init__(self):
+        self._busy = threading.Lock()
+        self._event = threading.Event()
+        self._result = False
+
+    def acquire(self, blocking=False):
+        return self._busy.acquire(blocking)
+
+    def begin(self):
+        """leader 在拿到锁后、发请求前调用：清掉上一轮的结果标记。"""
+        self._event.clear()
+
+    def wait_result(self, timeout=150.0):
+        """waiter 等结果；超时保守返回 False（leader 可能还在退避重试）。"""
+        if self._event.wait(timeout):
+            return self._result
+        return False
+
+    def publish(self, result):
+        self._result = bool(result)
+        self._event.set()
+
+    def release(self):
+        try:
+            self._busy.release()
+        except RuntimeError:
+            pass
+
+
+def _refresh_guard(uid):
+    key = str(uid or "")
+    with _REFRESH_GUARDS_LOCK:
+        guard = _REFRESH_GUARDS.get(key)
+        if guard is None:
+            guard = _InFlightRefresh()
+            _REFRESH_GUARDS[key] = guard
+        return guard
 
 
 # ---------------------------------------------------------------------------
@@ -1285,14 +1587,24 @@ class Account(object):
         safe_uid = re.sub(r"[^A-Za-z0-9_-]", "_", str(self.uid or "")).strip("_ ")
         name = (safe_uid or uuid.uuid4().hex) + ".json"
         path = base / name
-        tmp = base / (name + ".tmp")
+        # tmp 名带 pid + uuid：跨进程并发写同一账号时各自一个中间文件，
+        # os.replace 到同一目标依然是原子语义（最后写者胜出），不会再互相踩出
+        # 半截 JSON（旧实现固定 uid.json.tmp，两个进程同时写会落出坏文件）。
+        tmp = base / ("%s.%s.%d.tmp" % (name, uuid.uuid4().hex[:8], os.getpid()))
         if not (path.is_relative_to(base) and tmp.is_relative_to(base)):
             raise ValueError("invalid path for account save")
-        # 并发保护：/tasks 面板接口会并行刷新同一账号的多个字段（credits/plan/…），
-        # 每个都可能触发 save；同一 tmp 路径被两个线程同时写会落出坏 JSON。
-        with _SAVE_LOCK:
+        # 并发保护：① 进程内 _SAVE_LOCK 串行本进程线程（/tasks 面板会并行刷新
+        # 同一账号的多个字段）；② 进程外对账号目录的 flock(.save.lock) 把
+        # 「读-改-写」在多个网关实例之间也串行化（多实例部署补丁）。
+        with _SAVE_LOCK, _account_dir_flock(base):
             tmp.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2),
                            encoding="utf-8")
+            # 凭证文件落盘权限 0600（参照 _write_identity_cache_doc 的现成模式）：
+            # 账号 JSON 含明文 token，默认 umask 的 0644 会让同机其它用户读到。
+            try:
+                os.chmod(str(tmp), 0o600)
+            except OSError:
+                pass          # 不支持 chmod 的文件系统不应导致保存失败
             os.replace(tmp, path)
         self.path = str(path)
         return self.path
@@ -1322,15 +1634,20 @@ class Account(object):
         if self.model_token_limit_blocked(model):  # G4 单模型当日 token
             return False
         # ---- 护栏结束（下面才是 token 过期 -> refresh 的最后手段）----
+        # 注意：临期（0 < 剩余 <= 240s）**不再**在请求热路径同步 refresh ——
+        # _post_token 的超时退避最坏 ≈93s，会逐个阻塞用户请求，并发请求还会
+        # 惊群式地把同一个 refresh token 反复轮换。临期刷新改由调度器的保活
+        # 窗口提前完成（qoder_scheduler 的本地保活 tick，阈值 4h >> 240s）；
+        # 请求路径只读结果（expires_at），不触发刷新。
         exp = self.expires_at
         if not exp:
             return True
         remaining = exp - time.time()
-        if remaining > 240:          # 剩余 >4 分钟直接用（jt- 24h / dt- 30d）
-            return True
         if remaining > 0:
-            self.refresh()
+            # 未过期即放行（覆盖 240s 临期带）：真正的刷新在后台保活里做。
             return True
+        # 已过期：不刷就用不了 —— 同账号并发只刷一次，其他等结果
+        # （_InFlightRefresh 去重，见 refresh()）。
         return self.refresh()
 
     # -- 账号级预算护栏（task-61，全部纯内存读）------------------------------
@@ -1726,10 +2043,30 @@ class Account(object):
 
     # -- 刷新（按 token 前缀路由） ----------------------------------------
     def refresh(self):
-        """刷新 access token。drt- 走 deviceToken，jrt-/PAT 走 jobToken。
+        """刷新 access token（**in-flight 去重**：同一账号同一时刻只刷一次）。
 
-        PAT 永不覆盖活跃的 OAuth 会话，只做 jrt- 过期后的最终兜底。
+        并发调用（多个用户请求 / 调度器 / 看板同时发现该号要刷新）里只有
+        第一个真正发请求，其余等同一个结果 —— 避免惊群式的重复 token 轮换，
+        也避免每个调用各自承担最坏 ≈93s 的超时退避。drt- 走 deviceToken，
+        jrt-/PAT 走 jobToken；PAT 永不覆盖活跃的 OAuth 会话，只做 jrt-
+        过期后的最终兜底。
         """
+        guard = _refresh_guard(self.uid)
+        if not guard.acquire(blocking=False):
+            # 已有同账号刷新在飞：等结果，不再发第二个 refresh
+            return guard.wait_result()
+        guard.begin()
+        ok = False
+        try:
+            ok = self._refresh_once()
+            return ok
+        finally:
+            # 先发布再释放：waiter 拿到的是本次结果而不是超时False
+            guard.publish(ok)
+            guard.release()
+
+    def _refresh_once(self):
+        """refresh 的单次执行（路由分发），由 refresh() 保证同账号串行。"""
         cfg = get_realm_config(self.realm)
         base = cfg["openapi"]
         # 1) OAuth 设备族
@@ -1767,6 +2104,14 @@ class Account(object):
             if exc.code in (401, 403) and session_dead(body):
                 self.enabled = False
                 self.last_error = "session dead (TOKEN_EXPIRE): re-login required"
+                # 对称落盘：成功路径（下方）会 save()，禁用路径也必须立刻 save，
+                # 否则进程重启后死号会被重新读回 enabled=True 再次参与选号
+                # （历史缺陷：重启后死号复活）。
+                if self.path and os.path.exists(os.path.dirname(self.path)):
+                    try:
+                        self.save(os.path.dirname(self.path))
+                    except OSError:
+                        pass
             return False
         except Exception as exc:
             self.last_error = "refresh failed: %s" % exc
@@ -1820,14 +2165,17 @@ class Account(object):
         return self._checkin_cap, self._checkin_cap_reason
 
     def can_checkin(self):
-        """今日是否还需要签到（能力由运行时探测，不再按区域硬编码）。"""
+        """今日是否还需要签到（能力由运行时探测，不再按区域硬编码）。
+
+        「今日」按 UTC+8 业务日计算（上游 10:00 重置点所在时区），与
+        next_checkin_window / 日折叠同一根时钟。
+        """
         capable, _ = self.checkin_capability()
         if capable is False:
             return False
         if not self.last_checkin:
             return True
-        today_str = time.strftime("%Y-%m-%d")
-        return not str(self.last_checkin).startswith(today_str)
+        return not str(self.last_checkin).startswith(today_utc8())
 
     def checkin_status(self):
         """GET daily-check-in/status -> (ok, summary|error)。
@@ -1862,11 +2210,13 @@ class Account(object):
         last = ""
         if q.get("lastClaimedAt"):
             try:
-                last = time.strftime("%Y-%m-%d",
-                                     time.localtime(int(q["lastClaimedAt"])))
+                # 上游按 UTC+8 业务日刷新，领取时间也按 UTC+8 渲染（本地时区
+                # 为 UTC 的容器会把北京 08:00 渲染成「前一天」，导致看板误判）
+                last = datetime.datetime.fromtimestamp(
+                    int(q["lastClaimedAt"]), _UTC8).strftime("%Y-%m-%d")
             except Exception:
                 last = ""
-        today = time.strftime("%Y-%m-%d")
+        today = today_utc8()
         status = str(q.get("status") or "")
         return True, {
             "status": status,
@@ -2309,7 +2659,9 @@ class Account(object):
 
 
     def _stamp_checkin(self):
-        self.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")
+        # 签到时间戳按 UTC+8 业务日：can_checkin() 用同一根时钟比对，
+        # 漏配 TZ 的容器里不会再出现「同一业务日被判定为两天」。
+        self.last_checkin = now_utc8().strftime("%Y-%m-%d %H:%M:%S")
         if self.path and os.path.exists(os.path.dirname(self.path)):
             self.save(os.path.dirname(self.path))
 
@@ -2376,7 +2728,8 @@ class Account(object):
                  **_expiry_of(aq)},
             ],
             "updated_at": time.time(),
-            "updated_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
+            # 快照时间戳统一按 UTC+8 业务时钟渲染
+            "updated_iso": now_utc8().strftime("%Y-%m-%d %H:%M:%S"),
         }
         # task-61：余额刷新是 402 停放的**唯一**解封路径（remain > 0 才解）。
         self.revive_balance_cooldown()
@@ -2657,6 +3010,9 @@ class CreditsRefresher(object):
 
 
 class AccountPool(object):
+    # 坏 JSON 账号的隔离目录（点开头：load() 只扫顶层 *.json，子目录天然不扫）
+    CORRUPT_SUBDIR = ".corrupt"
+
     def __init__(self, directory, log=None):
         global _ACTIVE_POOL
         self.dir = directory
@@ -2670,11 +3026,19 @@ class AccountPool(object):
         self.quota_refresher = None
         # task-61 §2.6：临期加权轮询的运行期状态（uid -> 当前累计权重，重启即重置）
         self._expiry_weights = {}
+        # 坏 JSON 隔离计数（供 /health 等调用方读取：self.corrupt_count /
+        # self.corrupt_files；隔离后不再参与选号，避免每次启动都打一次坏文件）
+        self.corrupt_count = 0
+        self.corrupt_files = []
+        # 启动时校验容器时区（业务时序已统一 UTC+8，告警只是提醒）
+        warn_timezone_skew()
         _ACTIVE_POOL = self
 
     def load(self):
         with self._lock:
             self.accounts = []
+            self.corrupt_count = 0
+            self.corrupt_files = []
             if not os.path.isdir(self.dir):
                 return self.accounts
             for name in sorted(os.listdir(self.dir)):
@@ -2687,11 +3051,44 @@ class AccountPool(object):
                     with open(path, encoding="utf-8") as fh:
                         account = Account(json.load(fh), path)
                 except Exception as exc:
+                    # 坏 JSON 隔离：移入 accounts/.corrupt/（不动顶部扫描区），
+                    # 否则每次启动都要重新试着解析一次坏文件，且永远无法被修复。
+                    # 失败时退回旧行为（日志 + 跳过），绝不阻塞池加载。
                     self.log("account %s unreadable: %s" % (name, exc))
+                    quarantine = self._quarantine_corrupt(path, name)
+                    if quarantine:
+                        self.corrupt_count += 1
+                        self.corrupt_files.append(quarantine)
                     continue
                 if account.uid:
                     self.accounts.append(account)
+            if self.corrupt_count:
+                self.log("隔离 %d 个损坏的账号文件 -> %s（对 /health 可见："
+                         "pool.corrupt_count）" % (self.corrupt_count,
+                                                   self.corrupt_subdir()))
             return self.accounts
+
+    def corrupt_subdir(self):
+        """隔离目录的绝对路径（accounts/.corrupt）。"""
+        return os.path.join(str(self.dir), self.CORRUPT_SUBDIR)
+
+    def _quarantine_corrupt(self, path, name):
+        """把坏账号文件移入 .corrupt/；失败返回 ""（调用方退回跳过即可）。"""
+        try:
+            import shutil
+            dest_dir = self.corrupt_subdir()
+            os.makedirs(dest_dir, exist_ok=True)
+            dest = os.path.join(dest_dir, name)
+            if os.path.exists(dest):
+                # 同名已存在（多次损坏同名 uid）：追加时间戳避免覆盖
+                stem, ext = os.path.splitext(name)
+                dest = os.path.join(
+                    dest_dir, "%s.%s%s" % (stem, int(time.time() * 1000), ext))
+            shutil.move(path, dest)
+            return dest
+        except Exception as exc:
+            self.log("quarantine failed for %s: %s" % (name, exc))
+            return ""
 
     def list_public(self, realm=None):
         with self._lock:
@@ -3080,6 +3477,82 @@ class AccountPool(object):
         }
 
     # -- OAuth 设备授权登录 ------------------------------------------------
+    # 登录态（state/verifier）除了内存 dict，还落盘到 accounts/.logins/：
+    # 用户自测大多是单实例，但网关多实例容错時，受理登录的实例与轮询的实例
+    # 可能不是同一个——只存内存的话 poll_login 跨实例返回 "state not recognised"，
+    # 用户被迫重新授权。文件 0600、TTL 600s（与内存一致）、用后即删。
+    LOGINS_SUBDIR = ".logins"
+
+    def _logins_dir(self):
+        return os.path.join(str(self.dir), self.LOGINS_SUBDIR)
+
+    def _login_file(self, state):
+        state = str(state or "").strip()
+        if not state:
+            return ""
+        # state 形如 qd-<ns>，只作为文件名成分使用前先白名单化
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", state)
+        return os.path.join(self._logins_dir(), safe + ".json")
+
+    def _persist_login(self, state, info):
+        """把登录态写盘（原子 tmp+replace、0600）；失败不阻塞登录流程。"""
+        path = self._login_file(state)
+        if not path:
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = "%s.%s.%d.tmp" % (path, uuid.uuid4().hex[:8], os.getpid())
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(info, fh, ensure_ascii=False, indent=2)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+    def _load_login_from_disk(self, state):
+        """读回登录态；缺失/损坏返回 None。"""
+        path = self._login_file(state)
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            with open(path, encoding="utf-8") as fh:
+                info = json.load(fh)
+            if isinstance(info, dict) and info.get("verifier"):
+                return info
+        except Exception:
+            pass
+        return None
+
+    def _forget_login(self, state):
+        """用后即删（内存 + 落盘文件）。"""
+        with self._lock:
+            self.logins.pop(str(state or ""), None)
+        path = self._login_file(state)
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def _sweep_login_files(self):
+        """清理过期的登录态文件（TTL=LOGIN_TTL_SECONDS）；容错、不抛异常。"""
+        try:
+            d = self._logins_dir()
+            if not os.path.isdir(d):
+                return
+            now = time.time()
+            for name in os.listdir(d):
+                if not name.endswith(".json"):
+                    continue
+                path = os.path.join(d, name)
+                try:
+                    if now - os.path.getmtime(path) > LOGIN_TTL_SECONDS:
+                        os.remove(path)
+                except OSError:
+                    continue
+        except OSError:
+            pass
+
     @staticmethod
     def _local_machine_id(realm):
         """读取本机官方客户端的 machine_id（优先，保持设备一致），缺则生成。"""
@@ -3119,14 +3592,17 @@ class AccountPool(object):
             q["machine_id"] = self._local_machine_id(realm)
         auth_url = cfg["website"] + "/device/selectAccounts?" + urllib.parse.urlencode(q)
         state = "qd-%d" % time.time_ns()
+        info = {
+            "created": time.time(),
+            "verifier": verifier,
+            "nonce": nonce,
+            "region": realm,
+            "platform": platform,
+        }
         with self._lock:
-            self.logins[state] = {
-                "created": time.time(),
-                "verifier": verifier,
-                "nonce": nonce,
-                "region": realm,
-                "platform": platform,
-            }
+            self.logins[state] = info      # 内存快路径保留
+        self._sweep_login_files()
+        self._persist_login(state, info)   # 落盘：其它实例 poll 也能认出 state
         return {"state": state, "authUrl": auth_url, "realm": realm,
                 "platform": platform}
 
@@ -3135,11 +3611,16 @@ class AccountPool(object):
         with self._lock:
             info = self.logins.get(state)
         if not info:
+            # 内存没有（受理登录的是另一个实例 / 本进程重启过）：读盘
+            info = self._load_login_from_disk(state) or None
+            if info:
+                with self._lock:
+                    self.logins[state] = info
+        if not info:
             return {"status": "unknown",
                     "message": "state not recognised - start the login again"}
         if time.time() - info["created"] > LOGIN_TTL_SECONDS:
-            with self._lock:
-                self.logins.pop(state, None)
+            self._forget_login(state)
             return {"status": "expired", "message": "login window expired - start again"}
         realm = info.get("region") or "cn"
         cfg = get_realm_config(realm)
@@ -3222,13 +3703,24 @@ class AccountPool(object):
             "organizationName": org_name,
         })
         self.add(account)
-        with self._lock:
-            self.logins.pop(state, None)
+        # 授权完成：状态用完即删（内存 + 落盘文件一并清理）
+        self._forget_login(state)
         return {"status": "ok", "account": account.public()}
 
     def cancel_login(self, state):
+        """取消登录（内存 + 落盘文件都清理）。"""
+        path = self._login_file(state)
+        existed = False
         with self._lock:
-            return self.logins.pop(state, None) is not None
+            existed = bool(self.logins.pop(str(state or ""), None))
+        if path:
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+                    existed = True
+            except OSError:
+                pass
+        return existed
 
     # -- PAT 导入 ----------------------------------------------------------
     def import_pat(self, pat, realm="cn"):

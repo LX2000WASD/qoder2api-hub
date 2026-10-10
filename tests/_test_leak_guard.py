@@ -6,16 +6,21 @@ msgs 180–215，输入 95–105k token）；三条误伤用例对应修 B1 时�
 
 与 `_test_qoder.py` 的分工：那边多数断言直接调判据函数（离线判定），本文件把同样的
 形态喂进 `recover_leaked_tool_calls()` 走完整 SSE 管线、按客户端视角拼回正文 —— 判据
-写对了但管线接线错了时，只有这一层会红。可在发布镜像内直接跑（纯标准库，无 fixture）：
+写对了但管线接线错了时，只有这一层会红。可在发布镜像内直接跑（纯标准库，无 fixture）；已并入 tests/ 编排：
 
-    python _test_leak_guard.py                       # 退出码 0=GREEN，1=RED
-    docker exec -i qoder-proxy python3 - < _test_leak_guard.py
+    python tests/_test_leak_guard.py                 # 退出码 0=GREEN，1=RED
+    python tests/run_all.py                          # 或交给编排统一跑
+    docker exec -i qoder-proxy python3 - < tests/_test_leak_guard.py
 """
 import json
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# 套件在 tests/ 下，网关源码在上一层；直接 python tests/_test_leak_guard.py
+# 与 run_all.py 编排两种跑法都靠这两行找到 qoder_proxy
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 import qoder_proxy as qp                                     # noqa: E402
 
 PASS = FAIL = 0

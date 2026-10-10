@@ -851,30 +851,51 @@ def run_batch_pro_claim(targets, gap=1.0, inter_gap=1.5):
 # ---------------------------------------------------------------------------
 # 保活（token refresh 巡检）
 # ---------------------------------------------------------------------------
-def run_keepalive(pool, force=False, threshold_seconds=4 * 3600):
+# 本地保活失败停放窗口：调度器以 5 分钟节奏跑保活 tick，对坏凭证不停放就会
+# 连打上游（一天 288 次）；失败一次停放 1 小时。
+KEEPALIVE_PARK_SECONDS = 3600
+
+
+def run_keepalive(pool, force=False, threshold_seconds=4 * 3600,
+                  quiet=False, skip_until=None):
     """刷新凭证：force=True 刷新全部；否则只刷新剩余寿命不足阈值的账号。
 
+    · quiet=True：**无事可做时不输出日志**（调度器每 5 分钟的本地保活 tick
+      用它，否则看板日志会被「无需刷新」刷屏；周期巡检保留完整日志）。
+    · skip_until：{uid: 停放截止时间戳}，由调用方持有并传入（原地回写）——
+      上次刷新失败的账号在停放窗口内跳过。**已过期**（remain<=0）的账号不
+      受停放约束：请求路径到这一步会阻塞等一次刷新，停放会把它饿死。
     返回 {refreshed, failed, logs}。
     """
     logs, refreshed, failed = [], 0, 0
     now = time.time()
+    skip_until = skip_until if isinstance(skip_until, dict) else {}
     for acc in list(pool.accounts if pool else []):
         if not acc.enabled or not acc.access_token:
             continue
         remain = (acc.expires_at or 0) - now
         if not force and remain > threshold_seconds:
             continue
+        uid = acc.uid
+        if not force and remain > 0:
+            try:
+                if float(skip_until.get(uid) or 0) > now:
+                    continue          # 上一轮失败且在停放窗口内：本次不打上游
+            except (TypeError, ValueError):
+                pass
         nick = acc.nickname or acc.uid[:8]
         if force or remain <= threshold_seconds:
             logs.append(f"账号 [{nick}] Token 剩余 {_fmt_eta(remain)}，执行主动保活刷新...")
             if acc.refresh():
                 refreshed += 1
+                skip_until.pop(uid, None)      # 成功：解除停放
                 logs.append(f"✓ 账号 [{nick}] Token 保活刷新成功（{_fmt_eta((acc.expires_at or 0) - time.time())}）")
             else:
                 failed += 1
+                skip_until[uid] = now + KEEPALIVE_PARK_SECONDS
                 logs.append(f"! 账号 [{nick}] Token 保活刷新失败: {acc.last_error}")
             time.sleep(1.0)
-    if not logs:
+    if not logs and not quiet:
         logs.append("所有账号 Token 均未临近过期，无需刷新")
     for line in logs:
         _log(line)

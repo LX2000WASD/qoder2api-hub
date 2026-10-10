@@ -1,11 +1,16 @@
 name: Build Docker image
 
-# 打 v* tag（例如 v1.2.3）时自动构建并推送镜像到 GHCR，也可以在 Actions 页手动触发。
+# v* tag（例如 v1.2.3）：跑测试 + 冒烟，全绿后构建多架构镜像并推送 GHCR；
+# push 到 main / PR：只跑 test + smoke（不推送，纯验证回归）；
+# Actions 页面手动触发（workflow_dispatch）：与打 tag 同样会推送。
 # 不需要配置任何 secret，用默认的 GITHUB_TOKEN 即可。
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -13,7 +18,37 @@ permissions:
   packages: write
 
 jobs:
-  build:
+  # ---------------------------------------------------------------- 离线门禁
+  # tests/run_all.py 全部套件（纯标准库、无网络、约 15s）。任何触发都先跑：
+  # 坏逻辑应在构建镜像之前就红，而不是带着 tag 落 GHCR 之后才发现。
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # .js 套件需要 node；装上就连前端套件一起跑（镜像内无 node 时 run_all
+      # 会打印 [SKIP]，不会让编排挂掉）。
+      - name: 安装 Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: 跑 tests/run_all.py（全量套件）
+        run: python tests/run_all.py
+
+  # ---------------------------------------------------------------- 冒烟（不推送）
+  # 单架构构建后 load 进本地 daemon，直接对这个产物做存在性/导入/探活检查。
+  # ⚠️ 旧流程在 push:true 之后才冒烟，且冒烟用的是 docker build 重新构建的
+  # 镜像——坏镜像已经带着 tag 推到 GHCR 了（v1.3.2/v1.3.3 漏 COPY 模块时
+  # 正是这种「构建全绿、启动即 ModuleNotFoundError」的情况）。
+  smoke:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -21,7 +56,69 @@ jobs:
 
       - name: 计算镜像名（Docker 要求全小写）
         id: img
-        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 冒烟镜像只挂 type=sha 的标签（指向本次构建产物，不携带任何发布语义）
+      - name: 生成镜像 tag
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.img.outputs.name }}
+          tags: |
+            type=sha,format=short
+
+      # 单架构 + load：镜像是冒烟步骤里刚构建的那个，不再 build 第二次
+      - name: 构建单架构镜像（load 进本地 daemon，不推送）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 冒烟：验证「镜像真的能跑」——构建成功不等于镜像完整。
+      - name: 冒烟测试（非 root + 模块存在性 + 导入 + 探活）
+        run: |
+          set -euo pipefail
+          IMG="$(echo "${{ steps.meta.outputs.tags }}" | head -n1)"
+          echo "冒烟镜像：$IMG"
+          # 0) 非 root（P1）：容器进程必须以 uid 10001 运行
+          docker run --rm --entrypoint sh "$IMG" -c '[ "$(id -u)" = "10001" ] || { echo "::error::容器未以 uid 10001 运行"; exit 1; }; echo "runs as uid $(id -u)"'
+          # 1) 应用模块必须都在镜像里（用源码里的 import 反查，防「新增文件忘了 COPY」）
+          docker run --rm --entrypoint sh "$IMG" -c 'cd /app && for m in $(grep -hoE "^import (qoder_[a-z_]+)" *.py | awk "{print \$2}" | sort -u); do test -f "/app/$m.py" || { echo "MISSING: $m.py"; exit 1; }; done; echo "all app modules present"'
+          # 2) 关键模块可导入
+          docker run --rm --entrypoint python "$IMG" -c "import qoder_proxy, qoder_anthropic; print('imports ok')"
+          # 3) 进程能启动并响应探活
+          docker run -d --name smoke -p 18790:8790 "$IMG"
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18790/ping >/dev/null 2>&1; then ok=1; break; fi
+            sleep 2
+          done
+          if [ "$ok" != "1" ]; then echo "::error::容器未在 60s 内响应 /ping"; docker logs smoke; exit 1; fi
+          echo "冒烟通过"; docker logs smoke | tail -5
+          docker rm -f smoke >/dev/null
+
+  # ---------------------------------------------------------------- 发布（冒烟门禁之后）
+  publish:
+    needs: smoke
+    # 只有打 v* tag 或手动触发才推送；push main / PR 走到 smoke 为止
+    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 计算镜像名（Docker 要求全小写）
+        id: img
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "${GITHUB_OUTPUT}"
 
       # Dockerfile 里已按 TARGETARCH 提取对应平台的 UMID 组件，这里 amd64 / arm64 一起出
       - name: Set up QEMU
@@ -48,7 +145,9 @@ jobs:
             type=raw,value=latest
             type=sha,format=short
 
-      - name: 构建并推送
+      # 多架构推送。第二次构建走 gha 缓存：amd64 层基本是冒烟那次构建的命中，
+      # 只有 arm64 需要跑全量（QEMU 模拟，慢但与冒烟前没区别）。
+      - name: 构建并推送（多架构）
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -58,25 +157,3 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      # 冒烟：验证「镜像真的能跑」——构建成功不等于镜像完整。
-      # v1.3.2/v1.3.3 曾漏 COPY 一个模块：构建全绿，容器一启动就 ModuleNotFoundError。
-      - name: 冒烟测试（本地单架构构建 + 关键模块存在性 + 探活）
-        run: |
-          set -euo pipefail
-          IMG="qoder-smoke:${GITHUB_RUN_ID}"
-          docker build -t "$IMG" .
-          # 1) 应用模块必须都在镜像里（用源码里的 import 反查，防「新增文件忘了 COPY」）
-          docker run --rm --entrypoint sh "$IMG" -c 'cd /app && for m in $(grep -hoE "^import (qoder_[a-z_]+)" *.py | awk "{print \$2}" | sort -u); do test -f "/app/$m.py" || { echo "MISSING: $m.py"; exit 1; }; done; echo "all app modules present"'
-          # 2) 关键模块可导入
-          docker run --rm --entrypoint python "$IMG" -c "import qoder_proxy, qoder_anthropic; print('imports ok')"
-          # 3) 进程能启动并响应探活
-          docker run -d --name smoke -p 18790:8790 "$IMG"
-          ok=0
-          for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:18790/ping >/dev/null 2>&1; then ok=1; break; fi
-            sleep 2
-          done
-          if [ "$ok" != "1" ]; then echo "::error::容器未在 60s 内响应 /ping"; docker logs smoke; exit 1; fi
-          echo "冒烟通过"; docker logs smoke | tail -5
-          docker rm -f smoke
