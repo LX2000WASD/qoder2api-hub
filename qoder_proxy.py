@@ -667,7 +667,18 @@ def _persist_usage(row, summary=None, fail_label="usage persist failed"):
     try:
         usage_dir = Path(USAGE_DIR).resolve()
         usage_dir.mkdir(parents=True, exist_ok=True)
-        log_path = usage_dir / os.path.basename(USAGE_LOG)
+        # 按天轮转写入（跨队友契约）：usage-YYYYMMDD.jsonl，UTC+8 计日——
+        # qoder_accounts.usage_file_for_day 与读取侧 fold_daily_usage 用同
+        # 一根时钟，跨天边界的行必须落对文件否则会被日折叠漏掉。旧版
+        # accounts 缺该函数时退回旧 usage.jsonl 名（迁移期兼容）。
+        try:
+            _rot_name = os.path.basename(qoder_accounts.usage_file_for_day(
+                directory=str(USAGE_DIR)))
+        except Exception:
+            _rot_name = os.path.basename(USAGE_LOG)
+        if not _rot_name:
+            _rot_name = os.path.basename(USAGE_LOG)
+        log_path = usage_dir / _rot_name
         summary_path = usage_dir / os.path.basename(USAGE_SUMMARY)
         if not (log_path.is_relative_to(usage_dir)
                 and summary_path.is_relative_to(usage_dir)):
@@ -910,7 +921,15 @@ def _perf_stats_uncached(sample=5000, realm=None, since=None, until=None):
     total = ok = err = 0
     m_buckets = {}
     # 只读日志末尾 sample 行：readlines() 会把整个日志读成字符串列表。
-    rows = [raw.decode("utf-8", "replace") for raw in _tail_lines(USAGE_LOG, sample)]
+    # 轮转后跨文件取尾：日文件按日降序 → 旧 usage.jsonl，凑够 sample 行止。
+    _raw_tail = []
+    if sample and sample > 0:
+        for _tpath in reversed(_usage_log_files()):
+            _raw_tail = _tail_lines(_tpath, sample) + _raw_tail
+            if len(_raw_tail) >= sample:
+                _raw_tail = _raw_tail[-sample:]
+                break
+    rows = [raw.decode("utf-8", "replace") for raw in _raw_tail]
     for line in rows:
         line = line.strip()
         if not line:
@@ -1023,7 +1042,7 @@ def _usage_snapshot_uncached(realm=None):
     snap = _empty_stats()
     snap["started"] = _usage.get("started", time.time())
     try:
-        with open(USAGE_LOG, encoding="utf-8") as fh:
+        with _UsageLogChain() as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
@@ -1059,7 +1078,11 @@ def _usage_snapshot_uncached(realm=None):
         log("usage snapshot read failed: %s" % exc)
     snap["since"] = time.strftime("%Y-%m-%d %H:%M:%S",
                                   time.localtime(snap.get("started", time.time())))
-    snap["log_file"] = USAGE_LOG
+    # 轮转后读的是多个文件：展示成「旧文件 + N 个日文件」而不是单个旧名。
+    _lf = _usage_log_files()
+    snap["log_file"] = os.path.basename(_lf[0]) if len(_lf) == 1 \
+        else "%s + %d rotated day file(s)" % (os.path.basename(_lf[0]),
+                                             len(_lf) - 1)
     snap["realm"] = r
     snap["accounts_map"] = {a.uid: {"nickname": a.nickname, "realm": a.realm}
                             for a in POOL.accounts} if POOL else {}
@@ -1073,6 +1096,54 @@ def _usage_snapshot_uncached(realm=None):
         "accounts_ready": (POOL.count_ready() if POOL else 0),
     }
     return snap
+
+
+def _usage_log_files():
+    """轮转后要读回的 usage 文件（时间顺序）：旧 usage.jsonl + 同目录
+    usage-YYYYMMDD.jsonl 按日升序。
+
+    写入侧按天切之后，只读旧文件会漏掉切日后产生的新行——所有看板
+    统计都从这里取文件。夹具目录没有日文件时退化为单一旧文件（测试
+    缝透明，行为与轮转前逐位一致）。
+    """
+    base = str(USAGE_LOG)
+    files = [base]
+    folder = os.path.dirname(base)
+    if folder:
+        try:
+            names = sorted(n for n in os.listdir(folder)
+                           if n.startswith("usage-") and n.endswith(".jsonl"))
+        except OSError:
+            names = []
+        files.extend(os.path.join(folder, n) for n in names)
+    return files
+
+
+class _UsageLogChain(object):
+    """把多个 usage 日志文件串成一条可迭代的流。
+
+    保留 open() 的用法形状（with ... as fh: for line in fh:），各调用点
+    不用重排缩进即可跨文件读。缺失或不可读的文件自动跳过——与旧代码
+    对单文件 FileNotFoundError 的静默处理同义。
+    """
+
+    def __init__(self, paths=None):
+        self.paths = list(paths) if paths else _usage_log_files()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def __iter__(self):
+        for path in self.paths:
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    for line in fh:
+                        yield line
+            except Exception:
+                continue
 
 
 def _tail_lines(path, max_lines, chunk=256 * 1024):
@@ -1119,7 +1190,7 @@ def count_usage_rows(realm=None):
         needles = ('"realm": "%s"' % realm, '"realm":"%s"' % realm)
     n = 0
     try:
-        with open(USAGE_LOG, encoding="utf-8") as fh:
+        with _UsageLogChain() as fh:
             for line in fh:
                 if not line.strip():
                     continue
@@ -1143,28 +1214,19 @@ def count_usage_rows(realm=None):
     return n
 
 
-def recent_usage(limit=100, realm=None, page=1):
-    """Paginated rows from the tail of the log (page 1 is latest)."""
-    try:
-        limit = max(1, int(limit))
-    except Exception:
-        limit = 100
-    try:
-        page = max(1, int(page))
-    except Exception:
-        page = 1
-    total = count_usage_rows(realm)
-    total_pages = max(1, (total + limit - 1) // limit) if total > 0 else 1
-    page = min(page, total_pages)
-    target_count = page * limit
+def _recent_rows_from_file(path, realm, max_rows, chunk=256 * 1024):
+    """单文件从尾部向前收集最多 max_rows 条匹配行（返回顺序：新→旧）。
+
+    抽出来给 recent_usage 跨轮转文件复用：文件按 新→旧 逐个扫，直到
+    凑够 target_count；单文件缺失/不可读只跳过它自己。
+    """
     matching = []
-    chunk = 256 * 1024
     try:
-        with open(USAGE_LOG, "rb") as fh:
+        with open(path, "rb") as fh:
             fh.seek(0, os.SEEK_END)
             pos = fh.tell()
             buf = b""
-            while pos > 0 and len(matching) < target_count:
+            while pos > 0 and len(matching) < max_rows:
                 step = min(chunk, pos)
                 pos -= step
                 fh.seek(pos)
@@ -1182,9 +1244,9 @@ def recent_usage(limit=100, realm=None, page=1):
                     if realm and not row_matches_realm(item, realm):
                         continue
                     matching.append(item)
-                    if len(matching) >= target_count:
+                    if len(matching) >= max_rows:
                         break
-            if len(matching) < target_count and buf.strip():
+            if len(matching) < max_rows and buf.strip():
                 try:
                     item = json.loads(buf.strip().decode("utf-8", "replace"))
                     if not realm or row_matches_realm(item, realm):
@@ -1192,7 +1254,35 @@ def recent_usage(limit=100, realm=None, page=1):
                 except Exception:
                     pass
     except FileNotFoundError:
-        pass
+        return matching
+    except Exception as exc:
+        log("recent_usage read failed: %s" % exc)
+    return matching
+
+
+def recent_usage(limit=100, realm=None, page=1):
+    """Paginated rows from the tail of the log (page 1 is latest)."""
+    try:
+        limit = max(1, int(limit))
+    except Exception:
+        limit = 100
+    try:
+        page = max(1, int(page))
+    except Exception:
+        page = 1
+    total = count_usage_rows(realm)
+    total_pages = max(1, (total + limit - 1) // limit) if total > 0 else 1
+    page = min(page, total_pages)
+    target_count = page * limit
+    matching = []
+    try:
+        # 轮转后跨文件从新到旧扫：日文件按日降序，再到旧 usage.jsonl；
+        # 单文件缺失/不可读只跳过它自己（_recent_rows_from_file 兜底）。
+        for _rf in reversed(_usage_log_files()):
+            if len(matching) >= target_count:
+                break
+            matching.extend(_recent_rows_from_file(
+                _rf, realm, target_count - len(matching)))
     except Exception as exc:
         log("recent_usage read failed: %s" % exc)
     start_idx = (page - 1) * limit
@@ -1334,7 +1424,7 @@ def _usage_by_account_uncached(since=None, until=None):
     """Aggregate the JSONL log per account id（可选窗口过滤）。"""
     buckets = {}
     try:
-        with open(USAGE_LOG, encoding="utf-8") as fh:
+        with _UsageLogChain() as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
@@ -1404,7 +1494,7 @@ def _usage_by_key_uncached(since=None, until=None):
     """
     buckets = {}
     try:
-        with open(USAGE_LOG, encoding="utf-8") as fh:
+        with _UsageLogChain() as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
@@ -1502,7 +1592,7 @@ def _usage_timeseries_uncached(realm, lo, hi, step):
     buckets = {}
     credits = []
     try:
-        with open(USAGE_LOG, encoding="utf-8") as fh:
+        with _UsageLogChain() as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
@@ -1587,7 +1677,7 @@ def compute_usage_analytics(range=None, since=None, until=None):
     model_map = {}
     if os.path.exists(USAGE_LOG):
         try:
-            with open(USAGE_LOG, encoding="utf-8") as fh:
+            with _UsageLogChain() as fh:
                 for line in fh:
                     line = line.strip()
                     if not line:

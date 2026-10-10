@@ -53,7 +53,13 @@ try:
         P.record_usage("Qwen3.8-Flash", dict(_U39))
     except Exception as _e39:
         pass
-    _log39 = os.path.join(_ud39, os.path.basename(P.USAGE_LOG))
+    # usage 文件名契约（跨队友）：写入方按天切 usage-YYYYMMDD.jsonl，旧
+    # usage.jsonl 兼容迁移期。读回时**优先轮转名、回落旧名** —— 两种写入
+    # 模式下本断言都不破，写入方切换默认值时无需再动测试。
+    _name39 = os.path.basename(A.usage_file_for_day())
+    _log39 = os.path.join(_ud39, _name39)
+    if not os.path.isfile(_log39):
+        _log39 = os.path.join(_ud39, os.path.basename(P.USAGE_LOG))
     _row39 = {}
     if os.path.isfile(_log39):
         with open(_log39, encoding="utf-8") as _fh39:
@@ -63,8 +69,8 @@ try:
                 _row39 = json.loads(_lines39[-1])
             except Exception:
                 _row39 = {}
-    check("#60-10 端到端：写进 %s 的那一行 credit == 97.96（不再是 0）"
-          % os.path.basename(P.USAGE_LOG),
+    check("#60-10 端到端：写进 usage 文件（%s 或旧 usage.jsonl）的那一行 "
+          "credit == 97.96（不再是 0）" % _name39,
           _row39.get("credit") == 97.96,
           {_k: _row39.get(_k) for _k in ("credit", "original_credits",
                                          "prompt_tokens", "model")})
