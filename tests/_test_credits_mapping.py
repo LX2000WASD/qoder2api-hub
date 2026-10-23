@@ -54,9 +54,15 @@ try:
         P.record_usage("Qwen3.8-Flash", dict(_U39))
     except Exception as _e39:
         pass
-    _log39 = os.path.join(_ud39, os.path.basename(P.USAGE_LOG))
+    # 轮转后写入落到 usage-YYYYMMDD.jsonl：找写入方真正追加的那个文件
+    # （断言的是行内容，与文件名无关）。
+    _log39 = None
+    for _p39 in reversed(P._usage_log_files()):
+        if os.path.isfile(_p39):
+            _log39 = _p39
+            break
     _row39 = {}
-    if os.path.isfile(_log39):
+    if _log39:
         with open(_log39, encoding="utf-8") as _fh39:
             _lines39 = [l for l in _fh39.read().splitlines() if l.strip()]
         if _lines39:
@@ -65,7 +71,7 @@ try:
             except Exception:
                 _row39 = {}
     check("#60-10 端到端：写进 %s 的那一行 credit == 97.96（不再是 0）"
-          % os.path.basename(P.USAGE_LOG),
+          % os.path.basename(_log39 or P.USAGE_LOG),
           _row39.get("credit") == 97.96,
           {_k: _row39.get(_k) for _k in ("credit", "original_credits",
                                          "prompt_tokens", "model")})

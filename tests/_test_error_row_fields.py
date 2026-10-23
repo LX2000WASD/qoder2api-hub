@@ -35,9 +35,18 @@ P.USAGE_SUMMARY = os.path.join(_tmp, "usage-summary.json")
 
 
 def _last_row():
-    with open(P.USAGE_LOG, encoding="utf-8") as fh:
-        rows = [json.loads(x) for x in fh if x.strip()]
-    return rows[-1]
+    # 轮转后写入落到 usage-YYYYMMDD.jsonl（旧 usage.jsonl 仅迁移期兼容）。
+    # 这里断言的是「行的字段契约」，与具体文件名无关，所以读写入方真正
+    # 追加的那个文件（_usage_log_files() 返回旧 → 新，倒序即最新优先）。
+    for _p in reversed(P._usage_log_files()):
+        try:
+            with open(_p, encoding="utf-8") as fh:
+                rows = [json.loads(x) for x in fh if x.strip()]
+        except FileNotFoundError:
+            continue
+        if rows:
+            return rows[-1]
+    raise FileNotFoundError(P.USAGE_LOG)
 
 
 try:

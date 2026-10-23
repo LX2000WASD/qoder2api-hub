@@ -1141,39 +1141,120 @@ _EXPIRY_NEVER_EPOCH = 253402214400
 
 
 def usage_log_path():
-    """usage.jsonl 的路径。
+    """旧的单文件 usage.jsonl 路径（兼容读取迁移用）。
 
     优先级：USAGE_LOG_OVERRIDE（显式注入，测试/CLI）> QD_PROXY_USAGE_DIR
     > 本文件目录下的 usage/（与 qoder_proxy 的默认值一致）。
+    轮转后的按天文件见 usage_file_for_day()；本函数保留旧名供迁移期兼容读取，
+    也是 USAGE_LOG_OVERRIDE 注入点。
     """
     if USAGE_LOG_OVERRIDE:
         return str(USAGE_LOG_OVERRIDE)
-    d = os.environ.get("QD_PROXY_USAGE_DIR") or os.path.join(
+    return os.path.join(usage_dir(), "usage.jsonl")
+
+
+def usage_dir():
+    """usage 目录（与 qoder_proxy.USAGE_DIR 同源约定，路径约定保持不变）。
+
+    QD_PROXY_USAGE_DIR > <repo>/usage（与 qoder_proxy 的默认值一致）。
+    """
+    return os.environ.get("QD_PROXY_USAGE_DIR") or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "usage")
-    return os.path.join(d, "usage.jsonl")
+
+
+def now_utc8():
+    """当前 UTC+8 时刻（业务时区：日折叠/按天轮转统一用它）。
+
+    为什么不用 localtime：官方 compose 设了 TZ=Asia/Shanghai，但 K8s / 裸
+    docker 常漏掉 TZ——容器跑在 UTC 时按 localtime 算出来的“今天”会比业务
+    日早 8 小时，跨日边界的行会落错文件、日折叠也会漏。
+    """
+    return datetime.datetime.now(_UTC8)
+
+
+def today_utc8():
+    """业务日期「今天」（YYYY-MM-DD，UTC+8）。"""
+    return now_utc8().strftime("%Y-%m-%d")
+
+
+# 日折叠要回看的按天文件数量（当天 + 前 N-1 天；迁移期还要读旧 usage.jsonl）
+USAGE_FOLD_DAYS = 3
+
+
+def usage_file_for_day(day=None, directory=None):
+    """某一天的轮转 usage 文件：usage-YYYYMMDD.jsonl（跨队友契约的统一文件名）。
+
+    写入方（qoder_proxy）负责按天切分；读取方（本模块 fold_daily_usage）
+    只读当天 + 最近 N 天的文件（见 _usage_files_for_fold）。
+    """
+    day = str(day or today_utc8())
+    return os.path.join(directory or usage_dir(), "usage-%s.jsonl" % day)
+
+
+def _day_shift(day, delta_days):
+    """日期字符串加减一天（YYYY-MM-DD）。"""
+    d = datetime.datetime.strptime(str(day), "%Y-%m-%d").date()
+    d += datetime.timedelta(days=int(delta_days))
+    return d.strftime("%Y-%m-%d")
+
+
+def _usage_files_for_fold(day, log_path=None):
+    """折叠时要读的候选文件（**有界**）：
+
+      · 显式 log_path（或 USAGE_LOG_OVERRIDE）-> 只读它（测试注入/CLI）；
+      · 否则读「当天 + 前 N-1 天」的 usage-YYYYMMDD.jsonl（轮转后的新文件，
+        缺失即跳过）+ 旧的 usage.jsonl（迁移期写入方尚未按天切时，当天数据
+        仍落在旧文件里 —— 两者都读才能拼全当天计数）。
+    每个文件里的行最终仍按 iso 日期 == day 过滤，跨天不会串桶。
+    """
+    if log_path:
+        return [str(log_path)]
+    if USAGE_LOG_OVERRIDE:
+        return [str(USAGE_LOG_OVERRIDE)]
+    base = usage_dir()
+    out = []
+    try:
+        days = [_day_shift(day, -i)
+                for i in range(max(1, int(USAGE_FOLD_DAYS)))]
+    except (ValueError, TypeError):
+        # day 不是合法日期：只回退旧文件（与旧行为「全部过滤为空桶」等价，
+        # 不向调用方抛异常——折叠是纯读路径）
+        days = []
+    for d in days:
+        cand = usage_file_for_day(d, directory=base)
+        if os.path.isfile(cand):
+            out.append(cand)
+    legacy = os.path.join(base, "usage.jsonl")
+    if os.path.isfile(legacy):
+        out.append(legacy)
+    return out
 
 
 def fold_daily_usage(log_path=None, day=None, max_lines=200000):
-    """折叠「当日、按 uid」的 token / credit（只读本地 usage.jsonl，**不联网**）。
+    """折叠「当日、按 uid」的 token / credit（只读本地 usage 文件，**不联网**）。
 
     返回 {"day", "tokens"{uid:int}, "credits"{uid:float},
           "model_tokens"{uid:{model:int}}, "rows", "skipped"}。
     · 跨日自动归零：只统计 iso 日期 == day 的行（新的一天 -> 新桶）。
     · 文件缺失/不可读 -> 空桶（不是 None）；调用方据此把「有账号但今日无记录」
       折叠为 0（D4：默认 0 而不是 None，避免当天没流量的号永远 fail-open）。
-    · max_lines 只保留文件末尾 N 行（大日志保护）。
+    · max_lines 限制**每个文件**保留末尾 N 行（大日志保护）；轮转后单文件
+      本身就是一天的数据，整体扫描量有界。
+    · 日期一律按 UTC+8（上游 10:00 重置点所在时区），不再用本地时区。
     """
-    day = day or time.strftime("%Y-%m-%d")
+    day = day or today_utc8()
     out = {"day": day, "tokens": {}, "credits": {}, "model_tokens": {},
            "rows": 0, "skipped": 0}
-    path = log_path or usage_log_path()
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            keep = int(max_lines) if max_lines and int(max_lines) > 0 else None
-            tail = collections.deque(fh, maxlen=keep)
-    except Exception:
-        return out
-    for line in tail:
+    rows = []
+    for path in _usage_files_for_fold(day, log_path):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                keep = int(max_lines) if max_lines and int(max_lines) > 0 else None
+                tail = collections.deque(fh, maxlen=keep)
+        except Exception:
+            continue
+        rows.extend(tail)
+    for line in rows:
         line = line.strip()
         if not line:
             continue

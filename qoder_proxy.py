@@ -469,6 +469,20 @@ def _empty_stats():
 _usage = _empty_stats()
 
 
+# 汇总落盘的批量策略（写放大治理）：
+#   - JSONL 行仍**逐请求追加**（审计账目，丢一行就是丢一条账）；
+#   - 内存累加不再每请求 json_full-copy 一次 _usage（拷贝量随 by_model
+#     条目数线性放大，纯 CPU 浪费）；
+#   - 汇总文件改批量重写：每 N 行或 T 秒落一次，退出时强刷
+#     （见 flush_usage_summary 与 main() 的关闭钩子）。
+_USAGE_FLUSH_ROWS = max(1, int(os.environ.get("QD_USAGE_FLUSH_ROWS", "50") or 50))
+_USAGE_FLUSH_SECS = max(1.0, float(os.environ.get("QD_USAGE_FLUSH_SECS", "300") or 300))
+_USAGE_FLUSH_LOCK = threading.Lock()
+_usage_dirty_rows = 0
+_usage_last_flush_at = time.time()
+_usage_flusher_started = False
+
+
 def _extract_usage(usage):
     """Normalize the upstream usage block into the fields we track."""
     if not usage:
@@ -534,6 +548,7 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
       key_id            API key 的**标识**（panel id / legacy / launcher），不涉明文
     请求档位与实际档位同时落盘，才能看出归一化有没有把它们改掉/丢掉。
     """
+    global _usage_dirty_rows
     fields = _extract_usage(usage)
     if not fields:
         return None
@@ -599,8 +614,9 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
         for k in USAGE_FIELDS:
             if k in fields:
                 per[k] += fields[k]
-        summary = json.loads(json.dumps(_usage))
-    _persist_usage(row, summary, "usage persist failed")
+        _usage_dirty_rows += 1
+    _persist_usage(row, None, "usage persist failed")
+    _maybe_flush_usage_summary()
     # issue #43：把「这个号刚被用过」告诉余额刷新器（**只打标，不联网**）。
     # 打标失败绝不能影响记账/响应，所以整段吞异常。
     try:
@@ -622,40 +638,137 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
     return row
 
 
-def _persist_usage(row, summary, fail_label):
-    """Append one JSONL row and atomically rewrite the summary.
+def _persist_usage(row, summary=None, fail_label="usage persist failed"):
+    """Append one JSONL row; rewrite the summary atomically when given one.
 
     The temp file carries a unique suffix: two threads writing the same
     "<summary>.tmp" race, and the loser's os.replace() fails with ENOENT
     because the winner already renamed the file away.
+
+    summary=None 时只追加 JSONL 行——汇总重写已从热路径上摘掉，交给
+    批量路径 _flush_usage_summary（每 N 行 / T 秒 + 退出强刷），避免
+    每请求一次全量重写。
     """
     try:
         usage_dir = Path(USAGE_DIR).resolve()
         usage_dir.mkdir(parents=True, exist_ok=True)
-        log_path = usage_dir / os.path.basename(USAGE_LOG)
+        # 按天轮转写入（跨队友契约）：usage-YYYYMMDD.jsonl，UTC+8 计日——
+        # qoder_accounts.usage_file_for_day 与读取侧 fold_daily_usage 用同
+        # 一根时钟，跨天边界的行必须落对文件否则会被日折叠漏掉。旧版
+        # accounts 缺该函数时退回旧 usage.jsonl 名（迁移期兼容）。
+        try:
+            _rot_name = os.path.basename(qoder_accounts.usage_file_for_day(
+                directory=str(USAGE_DIR)))
+        except Exception:
+            _rot_name = os.path.basename(USAGE_LOG)
+        if not _rot_name:
+            _rot_name = os.path.basename(USAGE_LOG)
+        log_path = usage_dir / _rot_name
         summary_path = usage_dir / os.path.basename(USAGE_SUMMARY)
         if not (log_path.is_relative_to(usage_dir)
                 and summary_path.is_relative_to(usage_dir)):
             raise ValueError("usage path escapes base directory")
         with open(log_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-        tmp_summary = usage_dir / (
-            os.path.basename(USAGE_SUMMARY)
-            + ".%d.%d.tmp" % (os.getpid(), threading.get_ident()))
-        if not tmp_summary.is_relative_to(usage_dir):
-            raise ValueError("usage path escapes base directory")
-        try:
-            tmp_summary.write_text(json.dumps(summary, ensure_ascii=False,
-                                              indent=2), encoding="utf-8")
-            os.replace(tmp_summary, summary_path)
-        except Exception:
-            try:
-                os.unlink(tmp_summary)
-            except Exception:
-                pass
-            raise
+        if summary is None:
+            return
+        _write_usage_summary(summary, usage_dir, summary_path)
     except Exception as exc:
         log("%s: %s" % (fail_label, exc))
+
+
+def _write_usage_summary(summary, usage_dir, summary_path):
+    """原子重写汇总文件（唯一后缀 tmp + os.replace）。"""
+    tmp_summary = usage_dir / (
+        os.path.basename(USAGE_SUMMARY)
+        + ".%d.%d.tmp" % (os.getpid(), threading.get_ident()))
+    if not tmp_summary.is_relative_to(usage_dir):
+        raise ValueError("usage path escapes base directory")
+    try:
+        tmp_summary.write_text(json.dumps(summary, ensure_ascii=False,
+                                          indent=2), encoding="utf-8")
+        os.replace(tmp_summary, summary_path)
+    except Exception:
+        try:
+            os.unlink(tmp_summary)
+        except Exception:
+            pass
+        raise
+
+
+def _usage_snapshot():
+    """轻量快照：顶层浅拷贝 + by_model 逐模型浅拷贝。
+
+    替代旧路径每请求一次的 json.loads(json.dumps(_usage))：拷贝量曾随
+    by_model 条目数线性放大。参与拷贝的值全是标量，JSON 输出与深拷贝
+    逐位一致。
+    """
+    with _lock:
+        snap = dict(_usage)
+        snap["by_model"] = {k: dict(v) for k, v in _usage["by_model"].items()}
+    return snap
+
+
+def _maybe_flush_usage_summary():
+    """请求线程顺带判断：攒够 N 行或跨过 T 秒就落一次汇总。"""
+    with _lock:
+        due = (_usage_dirty_rows >= _USAGE_FLUSH_ROWS
+               or (time.time() - _usage_last_flush_at) >= _USAGE_FLUSH_SECS)
+    if due:
+        _flush_usage_summary()
+
+
+def _flush_usage_summary():
+    """重写一次汇总文件（有未落盘计数才写；并发由 _USAGE_FLUSH_LOCK 串行）。"""
+    global _usage_dirty_rows, _usage_last_flush_at
+    with _USAGE_FLUSH_LOCK:
+        with _lock:
+            if _usage_dirty_rows <= 0:
+                return
+        summary = _usage_snapshot()
+        try:
+            usage_dir = Path(USAGE_DIR).resolve()
+            usage_dir.mkdir(parents=True, exist_ok=True)
+            summary_path = usage_dir / os.path.basename(USAGE_SUMMARY)
+            if not summary_path.is_relative_to(usage_dir):
+                raise ValueError("usage path escapes base directory")
+            _write_usage_summary(summary, usage_dir, summary_path)
+        except Exception as exc:
+            log("usage summary flush failed: %s" % exc)
+            return
+        with _lock:
+            _usage_dirty_rows = 0
+            _usage_last_flush_at = time.time()
+
+
+def flush_usage_summary():
+    """关闭钩子：把内存里未落盘的计数强刷进汇总文件。"""
+    with _lock:
+        if _usage_dirty_rows <= 0:
+            return
+    _flush_usage_summary()
+
+
+def _start_usage_flusher():
+    """后台低频刷新：请求断流后 T 秒窗口内仍能把汇总落盘，不靠下一请求。
+
+    只启动一次、daemon 线程随进程退出（main 调；测试不经 main）。
+    """
+    global _usage_flusher_started
+    if _usage_flusher_started:
+        return
+    _usage_flusher_started = True
+
+    def _loop():
+        while True:
+            time.sleep(_USAGE_FLUSH_SECS)
+            try:
+                _flush_usage_summary()
+            except Exception:
+                pass
+
+    threading.Thread(target=_loop, name="qd-usage-flusher",
+                     daemon=True).start()
 
 
 def record_error(model, status, message, elapsed_ms=None,
@@ -671,6 +784,7 @@ def record_error(model, status, message, elapsed_ms=None,
     失败行带上账号/Key，才能看出「是哪个号在失败、是不是某个 Key 的客户端在
     打」；此前失败行这三项恒为空，面板只能显示成「历史行未记录 Key」。
     """
+    global _usage_dirty_rows
     row = {
         "at": time.time(),
         "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -692,8 +806,9 @@ def record_error(model, status, message, elapsed_ms=None,
         if elapsed_ms is not None:
             _usage["wall_ms_sum"] += elapsed_ms
             _usage["wall_samples"] += 1
-        summary = json.loads(json.dumps(_usage))
-    _persist_usage(row, summary, "error persist failed")
+        _usage_dirty_rows += 1
+    _persist_usage(row, None, "error persist failed")
+    _maybe_flush_usage_summary()
     dur = " %dms" % elapsed_ms if elapsed_ms is not None else ""
     log("request error: model=%s%s status=%s msg=%s"
         % (model, dur, status, str(message)[:360]),
@@ -814,7 +929,7 @@ def _perf_stats_uncached(sample=5000, realm=None, since=None, until=None):
     total = ok = err = 0
     m_buckets = {}
     # 只读日志末尾 sample 行：readlines() 会把整个日志读成字符串列表。
-    rows = [raw.decode("utf-8", "replace") for raw in _tail_lines(USAGE_LOG, sample)]
+    rows = [raw.decode("utf-8", "replace") for raw in _tail_lines_multi(sample)]
     for line in rows:
         line = line.strip()
         if not line:
@@ -939,7 +1054,7 @@ def _usage_snapshot_uncached(realm=None):
     snap = _empty_stats()
     snap["started"] = _usage.get("started", time.time())
     try:
-        with open(USAGE_LOG, encoding="utf-8") as fh:
+        with _UsageLogChain() as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
@@ -985,7 +1100,8 @@ def _usage_snapshot_uncached(realm=None):
         log("usage snapshot read failed: %s" % exc)
     snap["since"] = time.strftime("%Y-%m-%d %H:%M:%S",
                                   time.localtime(snap.get("started", time.time())))
-    snap["log_file"] = USAGE_LOG
+    snap["log_file"] = USAGE_LOG          # 兼容旧字段（迁移前的单文件名）
+    snap["log_files"] = _usage_log_files()  # 轮转后真实读取的文件（时间顺序）
     snap["realm"] = r
     snap["accounts_map"] = {a.uid: {"nickname": a.nickname, "realm": a.realm}
                             for a in POOL.accounts} if POOL else {}
@@ -1037,6 +1153,120 @@ def _tail_lines(path, max_lines, chunk=256 * 1024):
     return lines
 
 
+def _usage_log_files():
+    """轮转后要读回的 usage 文件（时间顺序）：旧 usage.jsonl + 同目录
+    usage-YYYYMMDD.jsonl 按日升序。
+
+    写入侧按天切之后，只读旧文件会漏掉切日后产生的新行——所有看板
+    统计都从这里取文件。夹具目录没有日文件时退化为单一旧文件（测试
+    缝透明，行为与轮转前逐位一致）。
+    """
+    # 目录解析：写入侧用 USAGE_DIR；但测试/CLI 常把 USAGE_LOG 显式钉到别处
+    # （「我就要读这个文件」），此时以 USAGE_LOG 所在目录为准。两者在正常
+    # 部署里恒为同一目录，因此生产行为与改动前逐位一致。
+    folder = os.path.dirname(str(USAGE_LOG))
+    # 只有「USAGE_LOG 这个文件真实存在且目录不同于 USAGE_DIR」才算显式钉住
+    # （测试/CLI 的 `P.USAGE_LOG = <tmp>/usage.jsonl` 手法）。其余情况一律
+    # 回落到 USAGE_DIR——写入侧真正用的那个目录。
+    pinned = bool(folder and folder != str(USAGE_DIR)
+                  and os.path.isfile(str(USAGE_LOG)))
+    if not pinned:
+        folder = str(USAGE_DIR)
+    base = os.path.join(folder, os.path.basename(str(USAGE_LOG)))
+    files = [base]
+    if folder:
+        try:
+            names = sorted(n for n in os.listdir(folder)
+                           if n.startswith("usage-") and n.endswith(".jsonl"))
+        except OSError:
+            names = []
+        files.extend(os.path.join(folder, n) for n in names)
+    return files
+
+
+class _UsageLogChain(object):
+    """把多个 usage 日志文件串成一条可迭代的流。
+
+    保留 open() 的用法形状（with ... as fh: for line in fh:），各调用点
+    不用重排缩进即可跨文件读。缺失或不可读的文件自动跳过——与旧代码
+    对单文件 FileNotFoundError 的静默处理同义。
+    """
+
+    def __init__(self, paths=None):
+        self.paths = list(paths) if paths else _usage_log_files()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def __iter__(self):
+        for path in self.paths:
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    for line in fh:
+                        yield line
+            except Exception:
+                continue
+
+
+def _tail_lines_multi(max_lines):
+    """跨轮转文件取尾部最多 max_lines 条非空行（新文件优先，返回旧→新）。"""
+    lines = []
+    for path in reversed(_usage_log_files()):
+        if len(lines) >= max_lines:
+            break
+        lines = _tail_lines(path, max_lines - len(lines)) + lines
+    return lines
+
+
+def _recent_rows_from_file(path, realm, max_rows, chunk=256 * 1024):
+    """单文件从尾部向前收集最多 max_rows 条匹配行（返回顺序：新→旧）。
+
+    抽出来给 recent_usage 跨轮转文件复用：文件按 新→旧 逐个扫，直到
+    凑够 target_count；单文件缺失/不可读只跳过它自己。
+    """
+    matching = []
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            pos = fh.tell()
+            buf = b""
+            while pos > 0 and len(matching) < max_rows:
+                step = min(chunk, pos)
+                pos -= step
+                fh.seek(pos)
+                buf = fh.read(step) + buf
+                parts = buf.split(b"\n")
+                buf = parts[0]
+                for raw in reversed(parts[1:]):
+                    st = raw.strip()
+                    if not st:
+                        continue
+                    try:
+                        item = json.loads(st.decode("utf-8", "replace"))
+                    except Exception:
+                        continue
+                    if realm and not row_matches_realm(item, realm):
+                        continue
+                    matching.append(item)
+                    if len(matching) >= max_rows:
+                        break
+            if len(matching) < max_rows and buf.strip():
+                try:
+                    item = json.loads(buf.strip().decode("utf-8", "replace"))
+                    if not realm or row_matches_realm(item, realm):
+                        matching.append(item)
+                except Exception:
+                    pass
+    except FileNotFoundError:
+        return matching
+    except Exception as exc:
+        log("recent_usage read failed: %s" % exc)
+    return matching
+
+
 def count_usage_rows(realm=None):
     """Cheap row count - substring match instead of a full JSON parse."""
     realm = realm_scope(realm)      # realm=all 走无 needles 分支，与逐行过滤一致
@@ -1045,7 +1275,7 @@ def count_usage_rows(realm=None):
         needles = ('"realm": "%s"' % realm, '"realm":"%s"' % realm)
     n = 0
     try:
-        with open(USAGE_LOG, encoding="utf-8") as fh:
+        with _UsageLogChain() as fh:
             for line in fh:
                 if not line.strip():
                     continue
@@ -1084,41 +1314,14 @@ def recent_usage(limit=100, realm=None, page=1):
     page = min(page, total_pages)
     target_count = page * limit
     matching = []
-    chunk = 256 * 1024
     try:
-        with open(USAGE_LOG, "rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            pos = fh.tell()
-            buf = b""
-            while pos > 0 and len(matching) < target_count:
-                step = min(chunk, pos)
-                pos -= step
-                fh.seek(pos)
-                buf = fh.read(step) + buf
-                parts = buf.split(b"\n")
-                buf = parts[0]
-                for raw in reversed(parts[1:]):
-                    st = raw.strip()
-                    if not st:
-                        continue
-                    try:
-                        item = json.loads(st.decode("utf-8", "replace"))
-                    except Exception:
-                        continue
-                    if realm and not row_matches_realm(item, realm):
-                        continue
-                    matching.append(item)
-                    if len(matching) >= target_count:
-                        break
-            if len(matching) < target_count and buf.strip():
-                try:
-                    item = json.loads(buf.strip().decode("utf-8", "replace"))
-                    if not realm or row_matches_realm(item, realm):
-                        matching.append(item)
-                except Exception:
-                    pass
-    except FileNotFoundError:
-        pass
+        # 轮转后跨文件从新到旧扫：日文件按日降序，再到旧 usage.jsonl；
+        # 单文件缺失/不可读只跳过它自己（_recent_rows_from_file 兜底）。
+        for _rf in reversed(_usage_log_files()):
+            if len(matching) >= target_count:
+                break
+            matching.extend(_recent_rows_from_file(
+                _rf, realm, target_count - len(matching)))
     except Exception as exc:
         log("recent_usage read failed: %s" % exc)
     start_idx = (page - 1) * limit
@@ -1313,7 +1516,7 @@ def _usage_by_account_uncached(since=None, until=None):
     """Aggregate the JSONL log per account id（可选窗口过滤）。"""
     buckets = {}
     try:
-        with open(USAGE_LOG, encoding="utf-8") as fh:
+        with _UsageLogChain() as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
@@ -1383,7 +1586,7 @@ def _usage_by_key_uncached(since=None, until=None):
     """
     buckets = {}
     try:
-        with open(USAGE_LOG, encoding="utf-8") as fh:
+        with _UsageLogChain() as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
@@ -1481,7 +1684,7 @@ def _usage_timeseries_uncached(realm, lo, hi, step):
     buckets = {}
     credits = []
     try:
-        with open(USAGE_LOG, encoding="utf-8") as fh:
+        with _UsageLogChain() as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
@@ -1553,12 +1756,24 @@ def _iter_usage_rows_since(since, chunk=256 * 1024):
 
     只在倒读终止时依赖时间有序性：单进程 append 保证同一时刻附近的行总在
     相邻块内，所以按 at 截断不会漏掉窗口内的行。
+
+    轮转后按文件从新到旧：usage-YYYYMMDD.jsonl 按日降序，最后才是旧的
+    usage.jsonl；每个文件内部仍从尾部倒读。任一文件倒读到早于 since 的行，
+    说明更旧的都不可能在窗口内，整体停止。
     """
-    try:
-        fh = open(USAGE_LOG, "rb")
-    except FileNotFoundError:
-        return
-    try:
+    for _path in reversed(_usage_log_files()):
+        try:
+            yield from _scan_backwards(_path, since, chunk)
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            log("daily usage tail read failed: %s" % exc)
+            continue
+
+
+def _scan_backwards(path, since, chunk):
+    """单文件从尾部倒读，产出 at >= since 的行；遇到更早的行即返回。"""
+    with open(path, "rb") as fh:
         fh.seek(0, os.SEEK_END)
         pos = fh.tell()
         buf = b""
@@ -1590,10 +1805,6 @@ def _iter_usage_rows_since(since, chunk=256 * 1024):
             at = row.get("at")
             if isinstance(at, (int, float)) and at >= since:
                 yield row
-    except Exception as exc:
-        log("daily usage tail read failed: %s" % exc)
-    finally:
-        fh.close()
 
 
 def _daily_group_id(row, group):
@@ -1650,7 +1861,7 @@ def _iter_usage_rows_forward(since, chunk=256 * 1024):
     被外部重排、或系统时钟大幅回拨导致倒读第一行就早于 since 时才需要它。
     """
     try:
-        with open(USAGE_LOG, "rb") as fh:
+        with _UsageLogChain() as fh:
             for raw in fh:
                 raw = raw.strip()
                 if not raw:
@@ -1669,10 +1880,14 @@ def _iter_usage_rows_forward(since, chunk=256 * 1024):
 
 
 def _usage_log_size():
-    try:
-        return os.path.getsize(USAGE_LOG)
-    except OSError:
-        return 0
+    """轮转后各文件大小之和（旧 usage.jsonl + 所有日文件）。"""
+    total = 0
+    for _p in _usage_log_files():
+        try:
+            total += os.path.getsize(_p)
+        except OSError:
+            continue
+    return total
 
 
 def _usage_log_head_ts(probe_bytes=4096):
@@ -1682,21 +1897,25 @@ def _usage_log_head_ts(probe_bytes=4096):
     情况都产出 0 行，正确处置却相反（前者不该扫，后者必须扫）。正常日志是
     单进程顺序 append 的，头行 at 最小；头行落在窗口内却一行都倒读不到，
     只能是文件被重排过。
+
+    轮转后「头」= 时间顺序上最旧的那个文件的第一行（_usage_log_files()
+    返回旧 → 新），空文件跳过。
     """
-    try:
-        with open(USAGE_LOG, "rb") as fh:
-            chunk = fh.read(probe_bytes)
-    except OSError:
-        return None
-    for raw in chunk.split(b"\n"):
-        raw = raw.strip()
-        if not raw:
-            continue
+    for _p in _usage_log_files():
         try:
-            at = json.loads(raw).get("at")
-        except Exception:
-            return None
-        return at if isinstance(at, (int, float)) else None
+            with open(_p, "rb") as fh:
+                chunk = fh.read(probe_bytes)
+        except OSError:
+            continue
+        for raw in chunk.split(b"\n"):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                at = json.loads(raw).get("at")
+            except Exception:
+                return None
+            return at if isinstance(at, (int, float)) else None
     return None
 
 
@@ -1850,9 +2069,9 @@ def compute_usage_analytics(range=None, since=None, until=None):
     win_model = {}      # model id -> stat
     acct_map = {}
     model_map = {}
-    if os.path.exists(USAGE_LOG):
+    if any(os.path.exists(_p) for _p in _usage_log_files()):
         try:
-            with open(USAGE_LOG, encoding="utf-8") as fh:
+            with _UsageLogChain() as fh:
                 for line in fh:
                     line = line.strip()
                     if not line:
@@ -5524,7 +5743,7 @@ def quality_snapshot(limit=500, ttl=30.0):
     ttfts, tps = [], []
     rows = 0
     try:
-        with open(USAGE_LOG, encoding="utf-8", errors="ignore") as fh:
+        with _UsageLogChain() as fh:
             tail = fh.readlines()[-limit:]
         for line in tail:
             try:
@@ -8938,7 +9157,7 @@ class Handler(BaseHTTPRequestHandler):
             _ov = _PRICING_OVERRIDES()
             _seen = set()
             try:
-                with open(USAGE_LOG, encoding="utf-8") as fh:
+                with _UsageLogChain() as fh:
                     for line in fh:
                         line = line.strip()
                         if not line:
@@ -9021,7 +9240,7 @@ class Handler(BaseHTTPRequestHandler):
             now = time.time()
             used = {}
             try:
-                with open(USAGE_LOG, encoding="utf-8") as fh:
+                with _UsageLogChain() as fh:
                     for line in fh:
                         line = line.strip()
                         if not line:
@@ -11308,6 +11527,11 @@ def main():
             signal.signal(signal.SIGTERM, _on_sigterm)
         except (ValueError, OSError, RuntimeError):
             pass            # 非主线程等极端情况：不拦启动
+    # 后台低频刷汇总：请求断流后 T 秒窗口内仍能落盘（batch 汇总策略）
+    try:
+        _start_usage_flusher()
+    except Exception as exc:
+        log("usage flusher start failed: %s" % exc, level="WARN")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -11319,13 +11543,18 @@ def main():
                 SCHEDULER.stop()
         except Exception as exc:
             log("scheduler stop failed: %s" % exc, level="WARN")
-        # 2) 先唤醒空闲 keep-alive 连接（EOF），再把优雅时间全部留给
+        # 2) 强刷 usage 汇总（批量落盘的兜底，见 record_usage）
+        try:
+            flush_usage_summary()
+        except Exception as exc:
+            log("usage summary flush failed: %s" % exc, level="WARN")
+        # 3) 先唤醒空闲 keep-alive 连接（EOF），再把优雅时间全部留给
         #    真正在途的请求（docker stop 默认 10s 后 SIGKILL，别空等）。
         try:
             server.nudge_idle_connections()
         except Exception:
             pass
-        # 3) 优雅期：docker stop 默认 10s 后 SIGKILL；QD_SHUTDOWN_GRACE 可调。
+        # 4) 优雅期：docker stop 默认 10s 后 SIGKILL；QD_SHUTDOWN_GRACE 可调。
         try:
             _grace = float(os.environ.get("QD_SHUTDOWN_GRACE", "10") or 10)
         except (TypeError, ValueError):
@@ -11341,7 +11570,7 @@ def main():
                 _left = -1
             log("grace period over: %d connection(s) still active, closing"
                 % _left, level="WARN")
-        # 4) 关监听 socket
+        # 5) 关监听 socket
         try:
             server.server_close()
         except Exception:
