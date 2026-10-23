@@ -9,6 +9,11 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
+## v1.8.1（本 fork）
+
+- **修复**：`QD_LOG_JSON=1` 时日志行尾写成了字面量 `\n`（两字符），导致 docker logs 里多行日志粘成一行、采集器无法按行解析。改为真正的换行符（`qoder_proxy.py` log()）。
+- 线上验证：三协议（chat/messages/responses）真实链路 200；上游接受 `parameters.temperature/top_p`（探针无错误信封）；`/v1/models` 在真实账号下展开为 11 个模型。
+
 ## v1.8.0（本 fork）
 
 > 合流前（v1.3.x–v1.4）的 fork 历史见 [docs/CHANGELOG-fork.md](docs/CHANGELOG-fork.md)。

@@ -62,7 +62,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -2854,7 +2854,7 @@ def log(msg, level=None, tag=None):
                            "tag": entry["tag"], "msg": entry["msg"],
                            "id": entry["id"]}, ensure_ascii=False)
         with _LOG_WRITE_LOCK:
-            sys.stdout.write(line + "\\n")
+            sys.stdout.write(line + "\n")
             sys.stdout.flush()
         return
     with _LOG_WRITE_LOCK:
