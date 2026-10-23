@@ -96,9 +96,19 @@ else:
 _reset_env()
 _umid_dir = os.path.join(_TMP, "umid")
 os.makedirs(_umid_dir, exist_ok=True)
-_real_ish = _write(os.path.join(_umid_dir, "runtime-info"), "#!/bin/sh\nexit 0\n")
+# 平台差异（CI windows-latest 抓到）：提取目录分支在 Windows 上认
+# runtime-info.exe，且要求同目录有 sgsdk.dll 才判定为完整组件（见
+# qoder_accounts.runtime_info_exe 的 os.name == "nt" 分支）；POSIX 只认
+# runtime-info。夹具必须照平台的查找规则造，否则断言测的是平台差异。
+if os.name == "nt":
+    _exe_name = "runtime-info.exe"
+else:
+    _exe_name = "runtime-info"
+_real_ish = _write(os.path.join(_umid_dir, _exe_name), "#!/bin/sh\nexit 0\n")
+if os.name == "nt":
+    _write(os.path.join(_umid_dir, "sgsdk.dll"), "", mode=0o644)
 os.environ["QD_UMID_DIR"] = _umid_dir
-check("未设 shim 时沿用原路径（QD_UMID_DIR/runtime-info）",
+check("未设 shim 时沿用原路径（QD_UMID_DIR/%s）" % _exe_name,
       A.runtime_info_exe("cn") == _real_ish, A.runtime_info_exe("cn"))
 os.environ["QD_UMID_SHIM"] = _shim
 A._native_exe_cache.clear()
