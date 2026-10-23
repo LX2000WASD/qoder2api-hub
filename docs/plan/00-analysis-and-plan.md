@@ -443,7 +443,7 @@ git fetch upstream --tags && git merge v1.7.0 && grep -rc '^<<<<<<< ' --include=
 | 生产 | ECS `/opt/qoder2api-hub`，host 网络只听 `127.0.0.1:8790`，`v1.4` → `v1.8.1`，RestartCount 0，healthy |
 | 生产 compose | 保留 `API_KEY` 强制鉴权；**故意不用 `--lan`**（host 网络下会绑 0.0.0.0）；新增 `umid-home` 卷与 `QD_UPDATE_DISABLE=1` |
 | 验证 | `/health` version=1.8.1 / 6 账号 ready；公网双域名 `/ping` 200；未带 Key `/v1/models` 401；chat/messages/responses 全 200（缓存命中 2593）；日志每行合法 JSON、完整 Key 命中 0；面板登录 200 |
-| 运维文档 | 新增 `32-qoder2api-hub-v1.8.1上线记录-2026-10-23.md`，并更新 `01/02/04/06/README` |
+| 运维文档 | 新增 `32-qoder2api-hub-v1.8.1上线记录-2026-10-23.md`，并更新 `02/04/06/README` |
 | 回滚 | compose 备份 + `accounts` tar + 旧镜像 `v1.4`（30 秒可回） |
 
 ### 13.6 仍待办
