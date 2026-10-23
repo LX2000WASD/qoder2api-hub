@@ -14,6 +14,12 @@
 
 ![网关总览](docs/img/dashboard.png)
 
+> **本仓库是 fork（v1.8.0）**：基线为上游 v1.7.0，另加一组上游没有的运行时强化——
+> SIGTERM 排空、连接上限与 SSE 背压、跨进程 flock / 调度 leader 锁、usage 按天轮转、
+> 非 root 镜像、`/metrics` 与 `QD_LOG_JSON`。升级必读（设备码切换、`--lan` 首启生成 Key、
+> 一键更新默认禁用）见 [CHANGELOG](CHANGELOG.md#v180本-fork) 与
+> [部署 · 本 fork 的运行时强化](docs/deployment.md#本-fork-的运行时强化v180-起)。
+
 ## 特性
 
 - **三种协议**：OpenAI Chat Completions、Responses API（Codex）、Anthropic Messages（Claude Code）

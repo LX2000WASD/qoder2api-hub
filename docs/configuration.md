@@ -194,3 +194,41 @@ python qoder_proxy.py [--host HOST] [--port PORT] [--lan] [--api-key KEY]
 
 代价：每代跑一轮都会多消耗一次账号额度；默认关闭。
 
+## 本 fork 增补的开关（v1.8.0）
+
+这些键**上游 v1.7.0 没有**，由本 fork 的运行时强化补丁提供；不设置时全部有安全默认值。
+
+### 进程生命周期与容量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `QD_SHUTDOWN_GRACE` | `10` | SIGTERM 后的排空窗口（秒）；空闲 keep-alive 连接会被立即唤醒，不占窗口 |
+| `QD_MAX_CONNECTIONS` | `256` | 活跃连接上限（不小于 8）；超限的新连接直接 503 |
+| `QD_SSE_QUEUE_SIZE` | `16` | SSE 读线程→主线程有界队列容量（背压传导到上游） |
+| `QD_SSE_IDLE_LIMIT` | `900` | 单次等待上游数据的上限（秒），超过抛 TimeoutError |
+| `QD_CONNECTION_TIMEOUT` | `120` | 空闲 keep-alive 连接的 socket 超时（秒） |
+
+### 用量流水
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `QD_USAGE_FLUSH_ROWS` | `50` | 攒够多少行 usage 就重写一次 `usage-summary.json` |
+| `QD_USAGE_FLUSH_SECS` | `300` | 距上次刷盘超过多少秒就重写汇总（另有退出强刷 + 后台线程） |
+| `QD_PROXY_USAGE_DIR` | `<repo>/usage` | 用量目录；按天文件名为 `usage-YYYY-MM-DD.jsonl`（UTC+8 计日） |
+
+### 日志与观测
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `QD_LOG_JSON` | 关 | `1/true/yes/on` 时日志改为 **stdout 单行 JSON**（`ts/level/tag/msg/id`），stderr 不再重复 |
+| `QD_TESTS_JOBS` | `4` | `tests/run_all.py` 的并发套件数（测试用） |
+
+### 更新
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `QD_UPDATE_DISABLE` | **`1`（本 fork 镜像/编排里默认开）** | 禁用一键更新端点，只保留「检查新版本」 |
+
+> `/metrics`（Prometheus 文本）与 `/readyz`（零就绪账号返 503）是 HTTP 行为，不是开关；
+> 详见 [部署 · 本 fork 的运行时强化](deployment.md#本-fork-的运行时强化v180-起)。
+
