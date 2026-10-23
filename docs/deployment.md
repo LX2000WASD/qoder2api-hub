@@ -44,9 +44,10 @@ python qoder_proxy.py --port 8790
 两个脚本都在**前台**运行，关闭窗口即停止。
 
 - 监听所有网卡，Base URL 是 `http://<本机局域网 IP>:8790/v1`
-- 局域网模式必须使用 API Key。不指定时，首次启动会生成一个 `qd-` 开头的随机 Key，保存到 `accounts/settings.json` 并打印在终端，之后重启继续使用同一个
-- 其他设备可以通过 `http://<IP>:8790/?key=<API Key>` 直接打开看板
-- 如果面板还在用默认密码，启动时会打印警告，看板也会拒绝显示明文 Key。请先修改面板密码
+- 局域网模式必须使用 API Key。不指定时，首次启动会生成一个 `qd-` 开头的随机 Key，保存到 `accounts/settings.json`（0600），之后重启继续使用同一个
+- **启动横幅默认只打印掩码**（`qd-****************abc`），也不再打印带 Key 的看板链接：登录看板后从「设置」页复制 Key。个人桌面用户想恢复上游那种完整 Key + `?key=` 链接，设 `QD_LOG_SENSITIVE=1`
+- 其他设备要带 Key 打开看板时，自行拼 `http://<IP>:8790/?key=<API Key>`（Key 从设置页复制）
+- 如果面板还在用默认密码，启动时会打印警告，看板也会拒绝显示明文 Key。请先修改面板密码。要让网关**拒绝启动**而不是只告警，见下面 Docker 的 `QD_REQUIRE_PANEL_PASSWORD`
 
 其他设备连不上时，放行防火墙：
 
@@ -60,26 +61,30 @@ python qoder_proxy.py --port 8790
 
 镜像发布在 GHCR，支持 `linux/amd64` 和 `linux/arm64`。
 
+首次部署先写面板密码（容器以 `--lan` 启动，对外发布端口时默认密码不可接受；
+仓库的 `docker-compose.yml` 已设 `QD_REQUIRE_PANEL_PASSWORD=1`，不写就拒绝启动）：
+
 ```bash
-# 使用预构建镜像（docker-compose.yml 的默认配置）
-docker compose pull
-docker compose up -d
-docker compose logs -f
+install -m 600 /dev/null qoder.env      # 可选：API_KEY= 放这里，别写进 compose
+docker compose run --rm qoder-proxy python -c \
+  "import qoder_settings; qoder_settings.set_panel_password('/app/accounts', '<新密码>')"
+docker compose pull && docker compose up -d && docker compose logs -f
 ```
 
 从源码构建：把 `docker-compose.yml` 里的 `image:` 注释掉，改用 `build: .`，然后执行 `docker compose up -d --build`。
 
-不用 compose 的话：
+不用 compose 的话（**端口仍然只发布到回环**，与 compose 一致）：
 
 ```bash
 docker run -d --name qoder-proxy --restart unless-stopped \
-  -p 8790:8790 \
+  -p 127.0.0.1:8790:8790 \
+  -e QD_REQUIRE_PANEL_PASSWORD=1 \
   -v "$(pwd)/accounts:/app/accounts" \
   -v "$(pwd)/usage:/app/usage" \
-  ghcr.io/shuishuipingan/qoder2api-hub:latest
+  ghcr.io/lx2000wasd/qoder2api-hub:latest
 ```
 
-**镜像 tag**（[包页面](https://github.com/shuishuipingan/qoder2api-hub/pkgs/container/qoder2api-hub)）：
+**镜像 tag**（[包页面](https://github.com/LX2000WASD/qoder2api-hub/pkgs/container/qoder2api-hub)）：
 
 | Tag | 含义 |
 |---|---|
@@ -90,10 +95,29 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 
 **容器配置：**
 
-- 容器以 `--lan` 启动，会强制使用 API Key：要么通过 `API_KEY` 环境变量传入，要么在首次启动时自动生成，用 `docker compose logs qoder-proxy | grep -i "api key"` 查看
-- 环境变量：`HOST`（默认 `0.0.0.0`）、`PORT`（默认 `8790`）、`API_KEY`、`TZ`（默认 `Asia/Shanghai`）。改 `PORT` 时要同步修改 `ports:` 映射
+- 容器以 `--lan` 启动，会强制使用 API Key：要么通过 `API_KEY` 环境变量传入（建议 0600 的 `env_file`），要么在首次启动时自动生成并写入 `./accounts/settings.json`（0600）
+- **端口只发布到宿主机回环**：`127.0.0.1:8790:8790`。容器内仍监听 `0.0.0.0`（`--lan` 语义），对外入口是反代（nginx + TLS）。写成 `8790:8790` 会把网关连同面板发布到所有网卡——上游 v1.7.0 的默认值，本 fork 不跟随
+- **面板默认密码门控**：`QD_REQUIRE_PANEL_PASSWORD=1` 时，监听 `0.0.0.0` 且面板密码仍是 `admin` 会**拒绝启动**（退出码 2，日志给出修复命令）；仓库的 compose 已设。默认 `0` = 上游行为（只 WARN）
+- 启动日志只打印**掩码** Key（`qd-****************abc`）：登录看板 → 设置页复制；`QD_LOG_SENSITIVE=1` 才按上游原样打印完整 Key 和 `?key=` 链接
+- 环境变量：`HOST`（默认 `0.0.0.0`）、`PORT`（默认 `8790`）、`API_KEY`、`TZ`（默认 `Asia/Shanghai`）、`QD_REQUIRE_PANEL_PASSWORD`、`QD_LOG_SENSITIVE`、`QD_UPDATE_DISABLE`。改 `PORT` 时要同步修改 `ports:` 映射
 - 需要持久化的两个目录：`/app/accounts` 和 `/app/usage`。NAS 或长期部署建议挂载绝对路径
-- 镜像自带健康检查，探测的是 `/ping`
+- 镜像自带健康检查，探测的是 `/ping`；`QD_UPDATE_DISABLE=1` 是镜像默认（一键更新端点返回 403）
+
+### 鉴权与 Key 轮换
+
+Key 的生效优先级（高 → 低），启动日志只打印**来源**、不打印值：
+
+| 顺位 | 来源 | 怎么设置 | 日志 `key_source=` |
+|---|---|---|---|
+| 1 | 命令行 `--api-key` | compose `command:` 里显式加 | `cli` |
+| 2 | 环境变量 `API_KEY`（或 `QD_PROXY_KEY`） | 0600 的 `qoder.env` + `env_file:` | `env` |
+| 3 | 面板保存的 Key | 看板 → 设置 → API Key | `panel` |
+| 4 | 自动生成的 launcher Key | 首启兜底，落 `accounts/settings.json` | `launcher` |
+
+- **面板里有启用中的 Key 时，launcher Key 不再被接受**（`identify_key` 的既有语义）：日志里的 Key 不一定等于最终接受的 Key，以 `/health` 的 `api_key_required` 和设置页为准
+- 生产把 Key 放 0600 的 `qoder.env`，不要写进 `docker-compose.yml` 明文（这个文件通常提交进 git）
+- 轮换：看板 → 设置改成新 Key 并保存（立即生效，旧 Key 失效）；或重启时带 `--api-key <新 Key>`。改完同步客户端
+- 只想换自动生成的 Key：删掉 `accounts/settings.json` 里的 `launcher_key` 字段（或删文件）后重启；注意这会同时重置面板密码
 
 ### 容器启动自检
 
@@ -103,7 +127,21 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 |---|---|
 | 与上游的时钟偏差超过 120 秒 | COSY 签名带时间戳，时钟偏差太大会让所有请求直接 401。同步宿主机时间即可 |
 | `accounts/` 不可写 | 设备身份无法落盘，每次重建容器都会换一台「设备」 |
+| `accounts/settings.json` 的权限不是 `600` | 文件里是 API Key 明文，同机其他用户可读。执行 `chmod 600 accounts/settings.json`（挂载目录被宿主机改过权限时最常见） |
 | 容器里启用了国际版账号（只在容器中检查） | 数据中心出口访问国际版网关容易被风控，表现为聊天一直排队。建议改用住宅出口，或改用国内版，见[风控处置手册](risk-control-playbook.md) |
+
+启动日志还有四行自检（**不含任何敏感值**，可直接贴进工单）：
+
+```text
+auth       : required=1 key_source=env | panel_default=0 | bind=0.0.0.0:8790
+security   : settings.json mode=600 | updater=disabled | sensitive_log=0
+ingress    : published=127.0.0.1:8790 (expected) | tls=external(nginx)
+identity   : device_id=uuidv4 | legacy=0 | umid=present(age=2h)
+```
+
+- `auth.key_source` 取 `cli` / `env` / `panel` / `launcher`，与上面「鉴权与 Key 轮换」的优先级表对应；`panel_default=1` 表示面板密码还是 `admin`
+- `ingress` 在容器内且监听 `0.0.0.0` 时按「回环发布 + 外部反代」推断；裸跑（非容器）会打印 `0.0.0.0:<port> (all interfaces)`，提示端口对所有网卡可见
+- `umid=present(age=…)` 的 age 是 `accounts/machine_identity.json` 的缓存年龄；`missing` 表示镜像里没有原生组件（功能降级为派生身份，签到链路可能被上游过滤）
 
 ### 容器里的设备身份
 
@@ -157,7 +195,7 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 | **一键更新（源码部署）** | 看板「运行信息」→ 有新版本时点 **一键更新**，见下 |
 | 源码（手动） | `git pull`，然后重启网关：Windows 先 `stop-qoder-proxy.bat` 再 `start-qoder-proxy.bat`；
 Linux / macOS 先 `./stop-qoder-proxy.sh` 再 `./start-qoder-proxy.sh`（常驻/launchd 场景直接 restart 也可） |
-| Docker | `docker compose pull && docker compose up -d` |
+| Docker | `docker compose pull && docker compose up -d`。**v1.8.0 起** compose 默认 `127.0.0.1:8790:8790` + `QD_REQUIRE_PANEL_PASSWORD=1`：面板若还是默认密码，先按上面「Docker」一节写密码，否则容器拒绝启动（日志会给出修复命令） |
 
 各版本的变更见[更新日志](../CHANGELOG.md)。
 
@@ -212,10 +250,27 @@ Linux / macOS 先 `./stop-qoder-proxy.sh` 再 `./start-qoder-proxy.sh`（常驻/
 
 ### 观测与安全
 
-- **`GET /metrics`**：Prometheus 文本格式（账号池 total/ready/cooling、requests/errors/tokens、活跃线程/连接）。与 `/health` 同级**免鉴权**，要加认证请在反向代理层挡。
+- **`GET /metrics`**：Prometheus 文本格式（账号池 total/ready/cooling、requests/errors/tokens、活跃线程/连接）。与 `/health` 同级**免鉴权**，要加认证请在反向代理层挡。指标里没有 Key、没有账号 uid（`*_tokens_total` 里的 “token” 是计量单位，不是凭据）。
 - **`QD_LOG_JSON=1`**：日志改为 stdout 单行 JSON（`ts/level/tag/msg/id`），供采集器解析；默认仍是人类可读格式写 stderr。
 - **`/readyz` 是就绪探针**：池中零就绪账号时返回 503（供 docker/k8s 摘流）；`/ping`、`/livez`、`/healthz` 仍是 liveness，恒返回 `pong`。
 - **`accounts/settings.json` 以 0600 落盘**（内含 API key 明文），并带 (mtime, size) 读缓存与写后失效。
+- **`/health` 的账号明细（`uid` / `domain` / `credential_file`）只在带 Key 或面板会话时返回**；未鉴权请求只有聚合计数。
+
+### Docker `--lan` 鉴权加固（v1.8.0 起）
+
+上游 v1.7.0 的 `--lan` 本身没问题，问题在它的配套默认值。本 fork 逐项加固（规格见
+`docs/plan/07-docker-auth.md` H1–H8，回归套件 `tests/_test_lan_auth.py`）：
+
+| # | 加固点 | 落地 | 回滚开关 |
+|---|---|---|---|
+| H1 | 端口只发布到宿主回环 | `docker-compose.yml` 的 `127.0.0.1:8790:8790`（不跟随上游 `8790:8790`） | 改回 `8790:8790`（不建议） |
+| H2 | Key 来源显式化，只记来源不记值 | 启动日志 `key_source=cli/env/panel/launcher` | 无（只加日志） |
+| H3 | 启动日志脱敏、不打印 `?key=` | `mask_secret()` + LAN 横幅（默认 `qd-****************abc`） | `QD_LOG_SENSITIVE=1`（= 上游原文） |
+| H4 | 面板默认密码硬门控 | `QD_REQUIRE_PANEL_PASSWORD=1` 时默认密码 + `0.0.0.0` 拒绝启动（退出码 2） | `QD_REQUIRE_PANEL_PASSWORD=0`（= 上游只 WARN） |
+| H5 | 凭据文件 0600 + 启动自检 | `qoder_settings.save()` 的 chmod（已保留）+ 启动 WARN | 无 |
+| H6 | 观测面收敛 | `/metrics` 无凭据/uid；`/health` 未鉴权不给账号明细 | 无 |
+| H7 | 一键更新默认关闭 | `qoder_updater.REPO` 指向本 fork + 镜像/编排 `QD_UPDATE_DISABLE=1` + `/update/apply` 403 | 去掉该环境变量并显式改回官方 REPO |
+| H8 | 启动自检四行 | `auth` / `security` / `ingress` / `identity` | 无 |
 
 ### 镜像与编排
 
