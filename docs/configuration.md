@@ -26,7 +26,7 @@ python qoder_proxy.py [--host HOST] [--port PORT] [--lan] [--api-key KEY]
 | `--accounts-dir` | `$ACCOUNTS_DIR` 或 `./accounts` | 账号与设置目录 |
 | `--usage-dir` | `$QD_PROXY_USAGE_DIR` 或 `./usage` | 用量流水目录 |
 | `--panel-password` | — | 启动时设置面板密码 |
-| `--system-prompt` | 官方模板 | 请求中没有 system 消息时使用的系统提示词 |
+| `--system-prompt` | 官方模板 | 请求中没有 system 消息时使用的系统提示词（`QD_MINIMAL_BODY=1` 时不注入官方模板，见[请求改写](#请求改写)） |
 | `--pid-file` | — | 把进程 PID 写入该文件，退出时删除（`stop-qoder-proxy.bat` 依赖它） |
 
 ## 面板密码
@@ -142,6 +142,7 @@ python qoder_proxy.py [--host HOST] [--port PORT] [--lan] [--api-key KEY]
 | `QD_TOOL_RESULT_KEEP_TAIL` | `1` | `tail` 模式下保留完整的最后几条 |
 | `QD_TOOLCHOICE_NONE_DROPS_TOOLS` | `0` | 设为 `1` 时，`tool_choice="none"` 的请求会连同 `tools` 一起删掉（旧行为） |
 | `QD_KEEP_TOPLEVEL_IMAGES` | `0` | 设为 `1` 时，图片除了放在消息内容里，还会在请求体顶层再放两份（旧行为，仅供排查。会让多图请求的体积变成 3 倍） |
+| `QD_MINIMAL_BODY` | `0` | 设为 `1` 时，请求体不再带模板自带的 `messages`/`tools`，**官方 Qoder 系统提示词不再兜底**（无 system 请求约省 12.7 KB / 3.1k tokens）；客户端 system 与 `--system-prompt` 的语义不变。默认 `0` 与合流前行为逐字节一致。usage 行会记录 `prompt_src` / `prompt_chars` / `tools_n` / `body_bytes`，便于灰度对比 |
 
 ### Anthropic 入口
 

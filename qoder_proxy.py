@@ -339,6 +339,32 @@ try:
 except Exception:
     BASEPROMPT = {}
 
+# QD_MINIMAL_BODY=1（灰度开关，默认 0）：不再把模板 messages/tools 带进请求体。
+# 默认 0 时与合流后的行为逐字节一致；开启后官方 system 不再兜底，客户端 system
+# 与 --system-prompt 的语义不变（见 docs/plan/01-prompt-kernel.md §4/§5.1）。
+# 模板本身仍保留：它是请求体骨架与回滚资产，只是把内容型字段（messages/tools）
+# 置空；其余协议/画像字段原样保留。
+BASEPROMPT_MINIMAL = {}
+try:
+    _bp_min = json.loads(json.dumps(BASEPROMPT))
+    _bp_min["messages"] = []
+    _bp_min["tools"] = []
+    BASEPROMPT_MINIMAL = _bp_min
+except Exception:
+    BASEPROMPT_MINIMAL = {}
+
+
+def minimal_body_enabled():
+    """True = 用空 messages/tools 的模板骨架，不注入官方 system。"""
+    return os.environ.get("QD_MINIMAL_BODY", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def base_prompt():
+    """按 QD_MINIMAL_BODY 选请求体骨架（每次调用现读 env，测试可切换）。"""
+    return BASEPROMPT_MINIMAL if minimal_body_enabled() else BASEPROMPT
+
+
 NOISE_KEYS = ("extra_fields", "refusal", "reasoning_content")
 
 # DeepSeek 上游 model key（官方目录：dmodel=DeepSeek-V4-Pro / dfmodel=DeepSeek-Flash）。
@@ -756,9 +782,23 @@ def row_matches_realm(row, realm):
     return realm == "cn"
 
 
+BODY_META_KEYS = ("prompt_src", "prompt_chars", "tools_n", "body_bytes")
+
+
+def _merge_body_meta(row, body_meta):
+    """把出站请求体检写进 usage 行（缺字段不写，旧行格式不变）。"""
+    if not isinstance(body_meta, dict):
+        return
+    for key in BODY_META_KEYS:
+        value = body_meta.get(key)
+        if value is not None:
+            row[key] = value
+
+
 def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
                  gen_ms=None, fp=None, account=None, effort=None,
-                 effort_requested=None, key_id=None, realm_reason=None):
+                 effort_requested=None, key_id=None, realm_reason=None,
+                 body_meta=None):
     """Accumulate stats, append a JSONL row, and persist the summary.
 
     P1-3（推理档位审计 + key 归属）：后三个参数都是**可选**的，旧调用路径不传
@@ -766,6 +806,9 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
       effort            实际下发给上游的档位（None = 本次没有下发该参数）
       effort_requested  客户端请求的原始档位（归一化之前）
       key_id            API key 的**标识**（panel id / legacy / launcher），不涉明文
+      body_meta         出站请求体检（prompt_src/prompt_chars/tools_n/body_bytes），
+                        由 open_upstream 从 build_qoder_body 的 meta_out 收集；
+                        不传 = 旧行格式不变（历史行与无关调用路径零影响）。
     请求档位与实际档位同时落盘，才能看出归一化有没有把它们改掉/丢掉。
     """
     global _usage_dirty_rows
@@ -784,6 +827,7 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
     row.update(fields)
     if fp:
         row.update(fp)
+    _merge_body_meta(row, body_meta)
     if account:
         row["account"] = account
     # P1-3：推理档位审计（请求档位 vs 实际下发档位）与 API key 归属。
@@ -992,7 +1036,7 @@ def _start_usage_flusher():
 
 
 def record_error(model, status, message, elapsed_ms=None,
-                 stream=None, account=None, key_id=None):
+                 stream=None, account=None, key_id=None, body_meta=None):
     """Count a failed request and append it to the log so errors are visible.
 
     后三个参数与 record_usage 同构，全是**可选**：不传就一个键都不写，行格式
@@ -1021,6 +1065,7 @@ def record_error(model, status, message, elapsed_ms=None,
         row["account"] = account
     if key_id:
         row["key_id"] = key_id
+    _merge_body_meta(row, body_meta)
     with _lock:
         _usage["errors"] += 1
         if elapsed_ms is not None:
@@ -5590,15 +5635,19 @@ def _keep_toplevel_images():
     return str(os.environ.get("QD_KEEP_TOPLEVEL_IMAGES") or "").strip().lower()         in ("1", "on", "true", "yes")
 
 
-def build_qoder_body(payload, account, model_key, realm=None):
+def build_qoder_body(payload, account, model_key, realm=None, meta_out=None):
     """构造 agent_chat_generation 上游请求体（返回 dict，随后 qoder_encode）。
 
     以官方 baseprompt.json 为骨架：每次覆写 request/session id、时间戳、
     模型配置（按出口区域的官方清单取元数据）、系统提示词与会话、工具、
-    参数与 business 会话名。
+    参数与 business 会话名。QD_MINIMAL_BODY=1 时骨架的 messages/tools 为空，
+    官方 system 不再兜底（base_prompt()）。
+
+    meta_out：可选出参 dict。传入时回填 prompt_src / prompt_chars / tools_n
+    （body_bytes 由 open_upstream 在编码后补，避免重复序列化整个 body）。
     """
     r = realm or (account.realm if account else CURRENT_REALM)
-    body = json.loads(json.dumps(BASEPROMPT))   # deep copy
+    body = json.loads(json.dumps(base_prompt()))   # deep copy
     messages = normalize_roles(payload.get("messages") or [])
     messages = sanitize_messages(messages)
     model = payload.get("model") or ""
@@ -5621,13 +5670,19 @@ def build_qoder_body(payload, account, model_key, realm=None):
     # 真实会话随后追加。
     tmpl_system = [m for m in (body.get("messages") or [])
                    if (m or {}).get("role") == "system"]
+    prompt_src = "none"   # usage 观测：client / cli / template / none
     if system_text is None:
         # 客户端没给 system：优先用 --system-prompt 覆盖值（非默认时），
-        # 否则保留模板自带的 Qoder 系统提示词。
+        # 否则保留模板自带的 Qoder 系统提示词。QD_MINIMAL_BODY=1 时模板的
+        # messages 已被 base_prompt() 置空，这里拿到 []，等价于不注入 system。
         if SYSTEM_PROMPT and SYSTEM_PROMPT != DEFAULT_SYSTEM_PROMPT:
             system_text = SYSTEM_PROMPT
+            prompt_src = "cli"
         else:
             body["messages"] = tmpl_system
+            prompt_src = "template" if tmpl_system else "none"
+    else:
+        prompt_src = "client"
     if system_text is not None:
         body["messages"] = [{"role": "system", "content": system_text}]
     # 追加真实会话
@@ -5736,6 +5791,17 @@ def build_qoder_body(payload, account, model_key, realm=None):
     biz.setdefault("type", "agent")
     biz.setdefault("stage", "start")
     body["business"] = biz
+
+    # 出站请求体检（只进 usage 行，不参与协议）。body_bytes 由
+    # open_upstream 在 qoder_encode 之后补，避免这里再序列化一次整个 body。
+    if meta_out is not None:
+        meta_out["prompt_src"] = prompt_src
+        meta_out["prompt_chars"] = sum(
+            len(m.get("content") or "")
+            for m in body["messages"]
+            if isinstance(m, dict) and m.get("role") == "system"
+            and isinstance(m.get("content"), str))
+        meta_out["tools_n"] = len(body.get("tools") or [])
     return body
 
 
@@ -6860,7 +6926,9 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
     # issue #86：钉死账号时用它构造请求体（身份类字段必须与被测号一致）
     representative = (only_account if only_account is not None
                       else (POOL.pick(realm=realm) if POOL else None))
-    body_obj = build_qoder_body(payload, representative, model_key, realm=realm)
+    body_meta = {}
+    body_obj = build_qoder_body(payload, representative, model_key,
+                                realm=realm, meta_out=body_meta)
     if usage_ctx is not None:
         # 实际下发档位直接取自请求体（build_qoder_body 只在 norm 非 None 时写入），
         # 与真实出站内容同源，不做二次推算。
@@ -6873,6 +6941,10 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
     encoded = qoder_encode(json.dumps(body_obj, ensure_ascii=False).encode("utf-8"))
     # issue #59：超限就地报 413，不发网络请求、不轮询账号（Broken pipe 会打爆账号池）
     _size = len(encoded.encode("utf-8")) if isinstance(encoded, str) else len(encoded)
+    if usage_ctx is not None:
+        # body_bytes 与 413 阈值同口径：qoder_encode 之后的出站字节数。
+        body_meta["body_bytes"] = _size
+        usage_ctx["body_meta"] = body_meta
     if _size > MAX_UPSTREAM_BODY_BYTES:
         log("outbound payload too large (%d bytes > %d) - refusing to send "
             "(issue #59)" % (_size, MAX_UPSTREAM_BODY_BYTES),
@@ -10408,8 +10480,10 @@ class Handler(BaseHTTPRequestHandler):
         # account 预置在 try 之外：下面所有 except 里的 record_error 都会引用它，
         # 而选号成功前它就是 None。必须在任何可能抛异常的语句之前。
         account = None
+        # usage_ctx 预置在 try 之外：下面所有 except 里的 record_error 都可能
+        # 引用它（读 body_meta），而 _request_realm 也不保证不抛。
+        usage_ctx = {}
         try:
-            usage_ctx = {}
             blocked = self._model_precheck(chat_req.get("model"), req_realm)
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")
@@ -10424,7 +10498,8 @@ class Handler(BaseHTTPRequestHandler):
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          stream=want_stream,
                          account=account.uid if account else None,
-                         key_id=self._key_id_for_usage())
+                         key_id=self._key_id_for_usage(),
+                         body_meta=usage_ctx.get("body_meta"))
             return self._rate_limited(exc)
         except UpstreamStatus as exc:
             # issue #59：PayloadTooLarge(413) 等本地拦下的错误——明确状态码，
@@ -10434,7 +10509,8 @@ class Handler(BaseHTTPRequestHandler):
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          stream=want_stream,
                          account=account.uid if account else None,
-                         key_id=self._key_id_for_usage())
+                         key_id=self._key_id_for_usage(),
+                         body_meta=usage_ctx.get("body_meta"))
             _msg, _etype = friendly_upstream_error(_code, exc.detail)
             return self._error(_code, _msg, _etype)
         except urllib.error.HTTPError as exc:
@@ -10448,7 +10524,8 @@ class Handler(BaseHTTPRequestHandler):
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          stream=want_stream,
                          account=account.uid if account else None,
-                         key_id=self._key_id_for_usage())
+                         key_id=self._key_id_for_usage(),
+                         body_meta=usage_ctx.get("body_meta"))
             msg, etype = friendly_upstream_error(exc.code, detail)
             return self._error(exc.code, msg, etype)
         except Exception as exc:
@@ -10457,7 +10534,8 @@ class Handler(BaseHTTPRequestHandler):
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          stream=want_stream,
                          account=account.uid if account else None,
-                         key_id=self._key_id_for_usage())
+                         key_id=self._key_id_for_usage(),
+                         body_meta=usage_ctx.get("body_meta"))
             if message.startswith("no usable account"):
                 return self._error(503, message
                                    + " - add or enable one at the dashboard (/)")
@@ -10493,7 +10571,8 @@ class Handler(BaseHTTPRequestHandler):
                                  effort=usage_ctx.get("effort"),
                                  effort_requested=usage_ctx.get("effort_requested"),
                                  key_id=self._key_id_for_usage(),
-                                 realm_reason=usage_ctx.get("realm_reason", ""))
+                                 realm_reason=usage_ctx.get("realm_reason", ""),
+                                 body_meta=usage_ctx.get("body_meta"))
                     return
                 except UpstreamStatus as exc:
                     # Anthropic 侧不重开（见 docstring）：直接给终态 error 事件。
@@ -10503,7 +10582,8 @@ class Handler(BaseHTTPRequestHandler):
                     record_error(model, exc.status, exc.detail,
                                  elapsed_ms=wall, stream=True,
                                  account=account.uid if account else None,
-                                 key_id=self._key_id_for_usage())
+                                 key_id=self._key_id_for_usage(),
+                                 body_meta=usage_ctx.get("body_meta"))
                     msg, _ = friendly_upstream_error(_to_int_status(exc.status),
                                                      exc.detail)
                     log("anthropic upstream status %s: %s"
@@ -10521,7 +10601,8 @@ class Handler(BaseHTTPRequestHandler):
                              effort=usage_ctx.get("effort"),
                              effort_requested=usage_ctx.get("effort_requested"),
                              key_id=self._key_id_for_usage(),
-                             realm_reason=usage_ctx.get("realm_reason", ""))
+                             realm_reason=usage_ctx.get("realm_reason", ""),
+                             body_meta=usage_ctx.get("body_meta"))
                 return
             try:
                 chat_obj, account = aggregate_with_envelope_retry(
@@ -10532,7 +10613,8 @@ class Handler(BaseHTTPRequestHandler):
                              elapsed_ms=int((time.time() - t_start) * 1000),
                              stream=want_stream,
                              account=account.uid if account else None,
-                             key_id=self._key_id_for_usage())
+                             key_id=self._key_id_for_usage(),
+                             body_meta=usage_ctx.get("body_meta"))
                 msg, etype = friendly_upstream_error(_to_int_status(exc.status),
                                                      exc.detail)
                 return self._error(
@@ -10542,7 +10624,8 @@ class Handler(BaseHTTPRequestHandler):
                              elapsed_ms=int((time.time() - t_start) * 1000),
                              stream=want_stream,
                              account=account.uid if account else None,
-                             key_id=self._key_id_for_usage())
+                             key_id=self._key_id_for_usage(),
+                             body_meta=usage_ctx.get("body_meta"))
                 return self._error(502, "upstream stream error: %s" % exc)
             wall = int((time.time() - t_start) * 1000)
             result = qoder_anthropic.chat_to_messages(chat_obj, model=model)
@@ -10551,7 +10634,8 @@ class Handler(BaseHTTPRequestHandler):
                          effort=usage_ctx.get("effort"),
                          effort_requested=usage_ctx.get("effort_requested"),
                          key_id=self._key_id_for_usage(),
-                         realm_reason=usage_ctx.get("realm_reason", ""))
+                         realm_reason=usage_ctx.get("realm_reason", ""),
+                         body_meta=usage_ctx.get("body_meta"))
             return self._json(200, result)
 
     def _handle_web_tools(self, path, payload, names):
@@ -10655,9 +10739,10 @@ class Handler(BaseHTTPRequestHandler):
         # 而选号成功前它就是 None。放在 try 内、open_upstream 之前也行 —— 只要
         # 在**任何可能抛异常的语句之前**（_request_realm 也不保证不抛）。
         account = None
+        # usage_ctx 预置在 try 之外：except 里的 record_error 要读 body_meta。
+        usage_ctx = {}          # P1-3：推理档位审计出参（下传给 open_upstream）
         try:
             req_realm = self._request_realm()
-            usage_ctx = {}          # P1-3：推理档位审计出参（下传给 open_upstream）
             blocked = self._model_precheck(chat_req.get("model"), req_realm)
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")
@@ -10704,7 +10789,8 @@ class Handler(BaseHTTPRequestHandler):
             record_error(model, 429, exc.detail[:200],
                          elapsed_ms=int(t * 1000), stream=want_stream,
                          account=account.uid if account else None,
-                         key_id=self._key_id_for_usage())
+                         key_id=self._key_id_for_usage(),
+                         body_meta=usage_ctx.get("body_meta"))
             return self._rate_limited(exc)
         except UpstreamStatus as exc:
             # issue #59：PayloadTooLarge(413) 等**上游未收到**的错误走这里——
@@ -10714,7 +10800,8 @@ class Handler(BaseHTTPRequestHandler):
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          stream=want_stream,
                          account=account.uid if account else None,
-                         key_id=self._key_id_for_usage())
+                         key_id=self._key_id_for_usage(),
+                         body_meta=usage_ctx.get("body_meta"))
             _msg, _etype = friendly_upstream_error(_code, exc.detail)
             return self._error(_code, _msg, _etype)
         except urllib.error.HTTPError as exc:
@@ -10730,7 +10817,8 @@ class Handler(BaseHTTPRequestHandler):
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          stream=want_stream,
                          account=account.uid if account else None,
-                         key_id=self._key_id_for_usage())
+                         key_id=self._key_id_for_usage(),
+                         body_meta=usage_ctx.get("body_meta"))
             msg, etype = friendly_upstream_error(exc.code, detail)
             return self._error(exc.code, msg, etype)
         except Exception as exc:
@@ -10739,7 +10827,8 @@ class Handler(BaseHTTPRequestHandler):
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          stream=want_stream,
                          account=account.uid if account else None,
-                         key_id=self._key_id_for_usage())
+                         key_id=self._key_id_for_usage(),
+                         body_meta=usage_ctx.get("body_meta"))
             if message.startswith("no usable account"):
                 return self._error(503, message
                                    + " - add or enable one at the dashboard (/)")
@@ -10793,7 +10882,8 @@ class Handler(BaseHTTPRequestHandler):
                                          effort=usage_ctx.get("effort"),
                                          effort_requested=usage_ctx.get("effort_requested"),
                                          key_id=self._key_id_for_usage(),
-                                         realm_reason=usage_ctx.get("realm_reason", ""))
+                                         realm_reason=usage_ctx.get("realm_reason", ""),
+                                         body_meta=usage_ctx.get("body_meta"))
                             return
                         except UpstreamStatus as exc:
                             _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
@@ -10868,7 +10958,8 @@ class Handler(BaseHTTPRequestHandler):
                                  elapsed_ms=int((time.time() - t_start) * 1000),
                                  stream=True,
                                  account=account.uid if account else None,
-                                 key_id=self._key_id_for_usage())
+                                 key_id=self._key_id_for_usage(),
+                                 body_meta=usage_ctx.get("body_meta"))
                     msg, _ = friendly_upstream_error(
                         _to_int_status(pump_exc.status), pump_exc.detail)
                     log("responses upstream status %s: %s"
@@ -10892,7 +10983,8 @@ class Handler(BaseHTTPRequestHandler):
                              effort=usage_ctx.get("effort"),
                              effort_requested=usage_ctx.get("effort_requested"),
                              key_id=self._key_id_for_usage(),
-                             realm_reason=usage_ctx.get("realm_reason", ""))
+                             realm_reason=usage_ctx.get("realm_reason", ""),
+                             body_meta=usage_ctx.get("body_meta"))
                 return
             try:
                 chat_obj, account = aggregate_with_envelope_retry(
@@ -10903,7 +10995,8 @@ class Handler(BaseHTTPRequestHandler):
                              elapsed_ms=int((time.time() - t_start) * 1000),
                              stream=want_stream,
                              account=account.uid if account else None,
-                             key_id=self._key_id_for_usage())
+                             key_id=self._key_id_for_usage(),
+                             body_meta=usage_ctx.get("body_meta"))
                 msg, etype = friendly_upstream_error(_to_int_status(exc.status),
                                                      exc.detail)
                 return self._error(exc.status if str(exc.status).isdigit() else 502,
@@ -10913,7 +11006,8 @@ class Handler(BaseHTTPRequestHandler):
                              elapsed_ms=int((time.time() - t_start) * 1000),
                              stream=want_stream,
                              account=account.uid if account else None,
-                             key_id=self._key_id_for_usage())
+                             key_id=self._key_id_for_usage(),
+                             body_meta=usage_ctx.get("body_meta"))
                 return self._error(502, "upstream stream error: %s" % exc)
             wall = int((time.time() - t_start) * 1000)
             result = chat_to_response(chat_obj, model, custom_names)
@@ -10922,7 +11016,8 @@ class Handler(BaseHTTPRequestHandler):
                          effort=usage_ctx.get("effort"),
                          effort_requested=usage_ctx.get("effort_requested"),
                          key_id=self._key_id_for_usage(),
-                         realm_reason=usage_ctx.get("realm_reason", ""))
+                         realm_reason=usage_ctx.get("realm_reason", ""),
+                         body_meta=usage_ctx.get("body_meta"))
             return self._json(200, result)
 
     def do_POST(self):
@@ -11120,9 +11215,10 @@ class Handler(BaseHTTPRequestHandler):
         # account 预置在 try 之外：下面所有 except 里的 record_error 都会引用它，
         # 而选号成功前它就是 None。必须在任何可能抛异常的语句之前。
         account = None
+        # usage_ctx 预置在 try 之外：except 里的 record_error 要读 body_meta。
+        usage_ctx = {}          # P1-3：推理档位审计出参（下传给 open_upstream）
         try:
             req_realm = self._request_realm()
-            usage_ctx = {}          # P1-3：推理档位审计出参（下传给 open_upstream）
             blocked = self._model_precheck(model, req_realm)
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")
@@ -11169,7 +11265,8 @@ class Handler(BaseHTTPRequestHandler):
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          stream=want_stream,
                          account=account.uid if account else None,
-                         key_id=self._key_id_for_usage())
+                         key_id=self._key_id_for_usage(),
+                         body_meta=usage_ctx.get("body_meta"))
             return self._rate_limited(exc)
         except UpstreamStatus as exc:
             # issue #59：PayloadTooLarge(413) 等**上游未收到**的错误走这里——
@@ -11179,7 +11276,8 @@ class Handler(BaseHTTPRequestHandler):
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          stream=want_stream,
                          account=account.uid if account else None,
-                         key_id=self._key_id_for_usage())
+                         key_id=self._key_id_for_usage(),
+                         body_meta=usage_ctx.get("body_meta"))
             _msg, _etype = friendly_upstream_error(_code, exc.detail)
             return self._error(_code, _msg, _etype)
         except urllib.error.HTTPError as exc:
@@ -11195,7 +11293,8 @@ class Handler(BaseHTTPRequestHandler):
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          stream=want_stream,
                          account=account.uid if account else None,
-                         key_id=self._key_id_for_usage())
+                         key_id=self._key_id_for_usage(),
+                         body_meta=usage_ctx.get("body_meta"))
             msg, etype = friendly_upstream_error(exc.code, detail)
             return self._error(exc.code, msg, etype)
         except Exception as exc:
@@ -11204,7 +11303,8 @@ class Handler(BaseHTTPRequestHandler):
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          stream=want_stream,
                          account=account.uid if account else None,
-                         key_id=self._key_id_for_usage())
+                         key_id=self._key_id_for_usage(),
+                         body_meta=usage_ctx.get("body_meta"))
             if message.startswith("no usable account"):
                 return self._error(503, message
                                    + " - add or enable one at the dashboard (/)")
@@ -11248,7 +11348,8 @@ class Handler(BaseHTTPRequestHandler):
                                          effort=usage_ctx.get("effort"),
                                          effort_requested=usage_ctx.get("effort_requested"),
                                          key_id=self._key_id_for_usage(),
-                                         realm_reason=usage_ctx.get("realm_reason", ""))
+                                         realm_reason=usage_ctx.get("realm_reason", ""),
+                                         body_meta=usage_ctx.get("body_meta"))
                             return
                         except UpstreamStatus as exc:
                             _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
@@ -11318,7 +11419,8 @@ class Handler(BaseHTTPRequestHandler):
                     record_error(model, exc.status, exc.detail,
                                  elapsed_ms=wall, stream=True,
                                  account=account.uid if account else None,
-                                 key_id=self._key_id_for_usage())
+                                 key_id=self._key_id_for_usage(),
+                                 body_meta=usage_ctx.get("body_meta"))
                     msg, etype = friendly_upstream_error(
                         _to_int_status(exc.status), exc.detail)
                     err = json.dumps({"error": {
@@ -11347,7 +11449,8 @@ class Handler(BaseHTTPRequestHandler):
                              effort=usage_ctx.get("effort"),
                              effort_requested=usage_ctx.get("effort_requested"),
                              key_id=self._key_id_for_usage(),
-                             realm_reason=usage_ctx.get("realm_reason", ""))
+                             realm_reason=usage_ctx.get("realm_reason", ""),
+                             body_meta=usage_ctx.get("body_meta"))
                 return
             try:
                 result, account = aggregate_with_envelope_retry(
@@ -11358,7 +11461,8 @@ class Handler(BaseHTTPRequestHandler):
                              elapsed_ms=int((time.time() - t_start) * 1000),
                              stream=want_stream,
                              account=account.uid if account else None,
-                             key_id=self._key_id_for_usage())
+                             key_id=self._key_id_for_usage(),
+                             body_meta=usage_ctx.get("body_meta"))
                 code = exc.status if str(exc.status).isdigit() else 502
                 try:
                     code = int(code)
@@ -11374,7 +11478,8 @@ class Handler(BaseHTTPRequestHandler):
                              elapsed_ms=int((time.time() - t_start) * 1000),
                              stream=want_stream,
                              account=account.uid if account else None,
-                             key_id=self._key_id_for_usage())
+                             key_id=self._key_id_for_usage(),
+                             body_meta=usage_ctx.get("body_meta"))
                 return self._error(502, "upstream stream error: %s" % exc)
             wall = int((time.time() - t_start) * 1000)
             first_at = result.get("first_chunk_at")
@@ -11386,7 +11491,8 @@ class Handler(BaseHTTPRequestHandler):
                          effort=usage_ctx.get("effort"),
                          effort_requested=usage_ctx.get("effort_requested"),
                          key_id=self._key_id_for_usage(),
-                         realm_reason=usage_ctx.get("realm_reason", ""))
+                         realm_reason=usage_ctx.get("realm_reason", ""),
+                         body_meta=usage_ctx.get("body_meta"))
             return self._json(200, result)
 
 
@@ -11415,7 +11521,8 @@ def main():
                     help="require this bearer token on /v1/* (optional)")
     ap.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT,
                     help="system message used when the request has none "
-                         "(default: keep the official Qoder template prompt)")
+                         "(default: keep the official Qoder template prompt; "
+                         "QD_MINIMAL_BODY=1 disables that fallback)")
     ap.add_argument("--usage-dir", default=None,
                     help="where to store usage.jsonl / usage-summary.json "
                          "(default: ./usage)")
@@ -11681,6 +11788,9 @@ def main():
         "qoder.com" if CURRENT_REALM == "intl" else "qoder.com.cn"))
     log("catalog    : %s" % (BASEPROMPT_PATH if BASEPROMPT
                              else "baseprompt.json MISSING"))
+    log("prompt     : %s" % (
+        "minimal (no template system fallback)"
+        if minimal_body_enabled() else "template fallback"))
 
     if args.host == "0.0.0.0":
         ips = local_ip_addresses() or ["<this-pc-ip>"]
