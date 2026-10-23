@@ -11,6 +11,8 @@
 
 ## v1.8.0（本 fork）
 
+> 合流前（v1.3.x–v1.4）的 fork 历史见 [docs/CHANGELOG-fork.md](docs/CHANGELOG-fork.md)。
+
 **基线切换到上游 v1.7.0**（89 个提交），本 fork 的运行时强化以 6 个补丁重新落盘。
 不是 merge：先在 `v1.7.0` 纯净基线上重放，再 `git merge -s ours` 记录分叉历史。
 
