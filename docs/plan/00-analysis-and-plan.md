@@ -404,25 +404,40 @@ git fetch upstream --tags && git merge v1.7.0 && grep -rc '^<<<<<<< ' --include=
 
 破坏性处理：`--lan` 保留（鉴权加固在 Wave 2）；`qoder_updater.REPO` → `LX2000WASD/qoder2api-hub`；`QD_UPDATE_DISABLE=1`；删 `qoder-proxy.pid` 并补 `.gitignore`；设备码切 UUIDv4（legacy 默认 0）。
 
-### 13.2 进行中（Wave 2）
+### 13.2 Wave 2 已完成（运行时强化收尾，合入 main）
 
-| 任务 | 内容 | 状态 |
-|---|---|---|
-| task-8 | `--lan` 鉴权加固 H1–H8（脱敏/门控/端口/settings 0600/updater/自检） | 进行中 |
-| task-9 | 运行时强化守卫套件 5–8 个（SIGTERM/背压/上限/flock/leader/轮转/metrics） | 进行中 |
-| task-12 | 补齐未重放能力（5min 轻保活/时区告警/scheduler property/Account flock） | 进行中 |
+| 任务 | 内容 | commit | 结果 |
+|---|---|---|---|
+| task-12 | 5min 轻保活 / 时区告警 / scheduler.enabled 立即落盘 / Account.save flock | c2b75d8 | 72 套件 / 1978 checks |
+| task-8 | `--lan` 鉴权加固 H1–H8（Key 四级优先+来源日志、掩码、面板默认密码门控、端口收紧、settings 0600、自检四行） | d29afba + 7f35460 | 74 套件 / 2063 checks |
+| task-9 | 运行时强化守卫套件 7 个（SIGTERM/排空/过载/背压/flock+leader/按天轮转/metrics+readyz） | d6b0f2a | 80 套件 / 2209 checks |
 
-### 13.3 待办（Wave 3+）
+容器冒烟：宿主仅 `127.0.0.1:8790`；日志完整 Key 命中 0、`?key=` 0；`settings.json=600`；无 Key `/v1`→401；默认密码+门控→exit 2；`/update/apply`→403。
 
-- task-10 `QD_MINIMAL_BODY` + 影子统计（Q1）
-- task-11 模型闸门止血：面板保存丢白名单 + 别名归一 + `/v1/models` 过滤（Q3）
-- UMID 可持续性（HOME/hostname/token 年龄）与 shim 灰度（Q2，用户已批准）
-- 参数透传探针（Q4，用户已批准；本机无账号，需在上线窗口用 1 次真实调用验证 `temperature` 是否 400）
-- 上线：镜像 `v1.8.0`、运维文档同步（[06-ops-sync.md](06-ops-sync.md)）、24h 观测
-- 未做（等用户授权）：push、打 tag、GHCR 发布
+### 13.3 Wave 3 已完成（自研第一轮，合入 main）
 
-### 13.4 已知遗留
+| 方向 | 内容 | commit | 实测 |
+|---|---|---|---|
+| Q3 模型管理 | 面板保存不再清空白名单（缺失=保留/显式 `[]`=清空）+ 别名归一 + `/v1/models` 过滤（`?all=1` 全量）+ 设置页「模型闸门」 | bf7bd48/58b73e9 | 过滤/回显/面板真实请求体（node 实跑）全绿 |
+| Q1 请求体瘦身 | `QD_MINIMAL_BODY`（默认 0）+ `prompt_src/prompt_chars/tools_n/body_bytes` 观测 | a05cc90 | 同一请求：mode0 12,784 B（含 system）→ mode1 35 B（无 system） |
+| Q2 UMID | 可写 `/app/home`（`adduser -h`）+ 启动自检 + `QD_UMID_SHIM` 灰度（默认关）+ 示例 shim | 293cf8d | `/diag/vm` 返回 shim 值且 `shim_active=1`；无 token 泄漏 |
 
-- 合流分支未 push；发布渠道 GHCR 命名空间已指向 fork（`ghcr.io/lx2000wasd/...`），首次发布需确认权限。
-- 生产 compose 与仓库 compose 是两份：本次只改了仓库那份，上线时要按 `06-ops-sync.md` §3 同步 `/opt/qoder2api-hub`。
-- `/health` 免鉴权公开 version/账号数/risk 计数（无密钥）——是否对公网收敛，待拍板（ops 06 §6 Q8）。
+最终门禁（main @ 65b0a09）：**83 套件 / 2305 checks 全绿**；`check_clean_checkout` 通过（并修好了它在 linked worktree 下静默空过的问题）。
+
+### 13.4 部署前必读的行为变更
+
+1. **鉴权**：容器以 `--lan` 启动，`/v1` 强制 Key；Key 优先级 `--api-key > API_KEY > 面板 > launcher`；启动日志只打印来源与掩码（`QD_LOG_SENSITIVE=1` 才还原上游原文）。
+2. **端口**：仓库 compose 收紧为 `127.0.0.1:8790:8790`；容器内仍监听 0.0.0.0，不新增外网暴露。
+3. **面板密码**：compose 设 `QD_REQUIRE_PANEL_PASSWORD=1`，默认密码 + 0.0.0.0 绑定会拒绝启动（exit 2）。上线前必须确认生产面板密码已改。
+4. **`/v1/models` 语义变化**：默认只列「官方 enable + 未全局封禁 + 当前 Key 白名单」内的模型，`?all=1` 才是全量；**无账号冷启动时快照里多数模型 `enable=false`，客户端可能只看到 1 个模型**（有账号后按真实套餐展开）。
+5. **设备码**：UUIDv4 形态、`QD_DEVICE_ID_LEGACY` 默认 0——对上游等于换一次设备（用户已拍板直接切）。
+6. **usage**：写入 `usage-YYYY-MM-DD.jsonl`（UTC+8），备份/清理脚本要按组文件处理；v1.7.0 的 `pricing-overrides.json` 也建议纳入备份。
+
+### 13.5 仍待办
+
+- **参数透传探针**（Q4，用户已批准）：本机无账号凭据，需在上线窗口用 1 次真实调用验证 `temperature` 是否被上游 400；通过后再灰度 `QD_PARAM_PASSTHROUGH`。
+- **shim 灰度观测**（Q2，用户已批准）：默认关，只在容器内做观测；服务端是否反查 token 仍未验证。
+- **上线窗口**：构建镜像 `v1.8.0`、按 [06-ops-sync.md](06-ops-sync.md) 更新阿里云运维文档、执行 24h 观测清单（usage 非零/失败行三字段/10605 等待/设备码形态）。
+- **等授权**：push、打 tag、GHCR 发布——均未执行。
+- **小遗留**：`tests/README.md` 套件表未补新套件；`_verify_models.py` 默认视图看不到 `enable=false` 模型（可加 `?all=1`）；排空窗口无显式 503；`QD_SSE_QUEUE_SIZE`/`QD_MAX_CONNECTIONS` 填非法值会 fail-fast 但缺友好提示；`/health` 是否对公网收敛待拍板。
+- **生产 compose 与仓库 compose 是两份**：本次只改仓库那份，上线时按 06 §3 同步 `/opt/qoder2api-hub`。
