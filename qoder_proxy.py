@@ -6741,6 +6741,13 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
         % realm)
 
 
+# SSE 读线程→主线程队列的容量上限（背压）：
+# 无界队列时，一个慢客户端会让上游全速把数据灌进内存。有界后主线程
+# 消费慢 → reader 阻塞在 put → 背压传导到上游（这是特性不是死锁：
+# reader 是 daemon 线程，连接关闭后随进程退出，不会把主线程卡住）。
+_SSE_QUEUE_MAXSIZE = max(1, int(os.environ.get("QD_SSE_QUEUE_SIZE", "16") or 16))
+
+
 def sse_with_heartbeat(source, send, interval=None, idle_limit=None):
     """在等待上游数据的空档里发送 SSE 注释心跳（`: ping`），并原样转发数据。
 
@@ -6768,12 +6775,15 @@ def sse_with_heartbeat(source, send, interval=None, idle_limit=None):
             yield item
         return
     if idle_limit is None:
-        idle_limit = 900.0
+        try:
+            idle_limit = float(os.environ.get("QD_SSE_IDLE_LIMIT", "900") or 900)
+        except (TypeError, ValueError):
+            idle_limit = 900.0
 
     import queue as _queue
     import threading as _threading
 
-    box = _queue.Queue()
+    box = _queue.Queue(maxsize=_SSE_QUEUE_MAXSIZE)   # 有界队列：背压上传导
     done = object()
 
     def _reader():
@@ -8120,14 +8130,32 @@ class QoderHTTPServer(ThreadingHTTPServer):
         self._conn_lock = threading.Lock()
         self._live_sockets = set()
 
+    # 活跃连接上限：看板高频轮询叠加慢客户端能把线程数顶到上千，超限的
+    # 新连接直接收 503（而不是排队等线程），客户端按常规退避重试即可。
+    max_active_connections = max(8, int(os.environ.get("QD_MAX_CONNECTIONS",
+                                                       "256") or 256))
+
     def active_connections(self):
         with self._conn_lock:
             return self._active_connections
 
     def process_request(self, request, client_address):
         with self._conn_lock:
-            self._active_connections += 1
-            self._live_sockets.add(request)
+            if self._active_connections >= self.max_active_connections:
+                over = True
+            else:
+                self._active_connections += 1
+                self._live_sockets.add(request)
+                over = False
+        if over:
+            try:
+                _reject_overloaded_connection(request)
+            finally:
+                try:
+                    request.close()
+                except Exception:
+                    pass
+            return
         ThreadingHTTPServer.process_request(self, request, client_address)
 
     def process_request_thread(self, request, client_address):
@@ -8170,6 +8198,21 @@ class QoderHTTPServer(ThreadingHTTPServer):
             if time.time() >= deadline:
                 return False
             time.sleep(0.05)
+
+
+def _reject_overloaded_connection(request):
+    """超上限连接的越界应答：不经 Handler 线程，裸写一个完整响应即关。"""
+    body = json.dumps({"error": {
+        "message": "server busy: too many active connections, retry later",
+        "type": "server_error", "code": 503}}, ensure_ascii=False).encode("utf-8")
+    head = ("HTTP/1.1 503 Service Unavailable\r\n"
+            "Content-Type: application/json; charset=utf-8\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n\r\n" % len(body)).encode("ascii")
+    try:
+        request.sendall(head + body)
+    except Exception:
+        pass
 
 
 class Handler(BaseHTTPRequestHandler):
