@@ -19,17 +19,37 @@ services:
     # 别照抄示例（所有人用同一个名字反而成了共同指纹）。
     # hostname: my-nas
     ports:
-      # 宿主机:容器。改容器监听端口时 PORT 与这里要一起改
-      - "8790:8790"
+      # 宿主机:容器。改容器监听端口时 PORT 与这里要一起改。
+      # ⚠️ 只发布到宿主机回环（H1，docs/plan/07-docker-auth.md）：容器内仍监听
+      # 0.0.0.0（--lan 语义），对外入口是 nginx TLS(45421) → 宿主
+      # 127.0.0.1:8790 → 容器。写成 "8790:8790" 会把网关连同面板直接发布到
+      # 所有网卡（上游 v1.7.0 的默认值，本 fork 不跟随）。
+      - "127.0.0.1:8790:8790"
+    # API Key 用 0600 的 env_file 注入（H2），不要把 Key 写进本文件的明文
+    # environment —— 这个文件通常会提交进 git：
+    #     install -m 600 /dev/null qoder.env && printf 'API_KEY=%s\n' '<key>' > qoder.env
+    # compose >= 2.24 可加 required: false 让文件缺失时也能启动；旧版 compose
+    # 对缺失的 env_file 会直接报错，因此这里默认注释掉。
+    # env_file:
+    #   - ./qoder.env
     environment:
       # HOST/PORT 真实生效：镜像 CMD 不再硬编码 --host/--port（argparse 读环境变量）
       - HOST=0.0.0.0
       - PORT=8790
+      # API_KEY 留空 = 容器以 --lan 启动，首次自动生成随机 Key 写入
+      # ./accounts/settings.json（0600）。启动日志只打印**掩码**
+      # （qd-****************abc）：登录面板到设置页复制，或显式设
+      # QD_LOG_SENSITIVE=1 恢复上游那种完整 Key。
+      # 生产请改用上面的 env_file（0600）注入，不要写在这里。
       # - API_KEY=your_api_key_here
       # 本 fork 默认禁用「一键更新」（REPO 指向 fork；上游 tarball 会覆盖本地补丁）
       - QD_UPDATE_DISABLE=1
-      # ↑ 留空：容器以 --lan 启动，首次自动生成随机 Key 写入 ./accounts/settings.json
-      #   并打印在日志（docker compose logs qoder-proxy | grep -i "api key"）
+      # H4：默认面板密码 'admin' 时拒绝启动（面板跟端口一起暴露 = 账号池失守）。
+      # 首次部署先写面板密码，再 up -d：
+      #   docker compose run --rm qoder-proxy python -c \
+      #     "import qoder_settings; qoder_settings.set_panel_password('/app/accounts', '<新密码>')"
+      # 或者启动时带 --panel-password <新密码>。个人本机用法可改回 0（= 上游行为）。
+      - QD_REQUIRE_PANEL_PASSWORD=1
       - TZ=Asia/Shanghai
     volumes:
       # 持久化挂载账号凭证与用量流水

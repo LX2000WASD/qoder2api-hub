@@ -23,6 +23,9 @@ FROM python:3.11-alpine
 # （docker build 的 SecretsUsedInArgOrEnv lint 提示来自变量名，而非真实密钥内容。）
 # 本 fork 默认禁用「一键更新」：qoder_updater 的 REPO 指向本 fork，但上游
 # release 的 tarball 会覆盖本地补丁；容器内更不该自我替换代码。
+# 注意：QD_REQUIRE_PANEL_PASSWORD 与 QD_LOG_SENSITIVE 刻意**不在这里设默认值**
+# ——前者由对外发布端口的编排显式开启（见 docker-compose.yml），后者保持代码
+# 默认 0（掩码）。这样 docker run 的一次性用法与上游行为一致。
 ENV PYTHONUNBUFFERED=1 \
     HOST=0.0.0.0 \
     PORT=8790 \
@@ -93,7 +96,15 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 #
 # --lan 是有意的（wb 修过的真实事故：端口发布到宿主网络而 Key 校验默认关闭，
 # 等于把上游额度向全网段裸奔）：--lan 监听全部网卡并**强制**生成随机 Key——
-# 首次写入 ./accounts/settings.json 并打印在启动日志（docker logs 里 grep -i
-# "api key" 可查）。显式传了 API_KEY 环境变量时仍以它为准（--api-key 默认读
-# 环境变量，argparse 的显式值优先级最高）。
+# 首次写入 ./accounts/settings.json（0600）并打印在启动日志。
+#
+# 启动横幅的安全默认值（v1.8.0 起，docs/plan/07-docker-auth.md）：
+#   * 只打印**掩码** Key（qd-****************abc），且不再打印 ?key= 看板链接；
+#     要上游那种完整 Key，显式设 QD_LOG_SENSITIVE=1。
+#   * 默认面板密码 'admin' + 监听 0.0.0.0 时只告警（与上游一致）。对外发布
+#     端口（反代/公网）时由编排设 QD_REQUIRE_PANEL_PASSWORD=1 拒绝启动，直到
+#     面板密码改掉为止——本仓库的 docker-compose.yml 已设，镜像层不设默认值，
+#     避免影响 docker run 的一次性用法。
+#   * 显式传了 API_KEY 环境变量时仍以它为准（--api-key 默认读环境变量，
+#     argparse 的显式值优先级最高）。
 CMD ["python", "qoder_proxy.py", "--lan"]

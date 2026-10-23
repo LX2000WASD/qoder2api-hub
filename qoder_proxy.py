@@ -453,6 +453,226 @@ def identify_key(supplied):
     extra = () if configured_keys() else (API_KEY,)
     return qoder_settings.match_api_key(ACCOUNTS_DIR, supplied, extra_keys=extra)
 
+# ---------------------------------------------------------------------------
+# 启动鉴权加固（v1.8.0 / docs/plan/07-docker-auth.md H2-H5、H8）
+#
+# 上游 v1.7.0 的 --lan 语义本身没问题，风险在它的**配套默认值**：启动日志打印
+# 完整 Key（连 ?key= 看板链接）、面板默认密码只告警、settings.json 不设权限。
+# 这里补齐这三件事，并加一组启动自检。默认值一律向后兼容：
+# QD_LOG_SENSITIVE=0 / QD_REQUIRE_PANEL_PASSWORD=0 时行为与上游一致。
+# ---------------------------------------------------------------------------
+KEY_SOURCES = ("cli", "env", "panel", "launcher", "none")
+
+
+def sensitive_log():
+    """QD_LOG_SENSITIVE=1 时按上游原样打印 Key（个人桌面兼容开关）。
+
+    默认 0：启动日志只打印掩码（H3）。容器 stdout 会进 docker logs、日志采集
+    器与宿主机备份——完整 Key 出现在那里就等于凭据泄露。
+    """
+    return _env_flag("QD_LOG_SENSITIVE")
+
+
+def mask_secret(value, keep_prefix=3, keep_suffix=4):
+    """日志用掩码：qd-****************abc（前缀 3 + 16 星 + 后缀 4）。
+
+    QD_LOG_SENSITIVE=1 时原样返回（上游行为）。短于「前缀+后缀」的值整串打星
+    ——否则「掩码」可能等于原文，等于假脱敏。
+    """
+    if sensitive_log():
+        return value
+    text = str(value or "")
+    if not text:
+        return ""
+    if len(text) <= keep_prefix + keep_suffix:
+        return "*" * 16
+    return text[:keep_prefix] + "*" * 16 + text[-keep_suffix:]
+
+
+def _argv_has_option(name, argv=None):
+    """命令行里是否**显式**给了该选项（用来区分 --api-key 与环境变量）。"""
+    items = list(sys.argv[1:] if argv is None else argv)
+    return any(item == name or item.startswith(name + "=") for item in items)
+
+
+def resolve_api_key(cli_key=None, env_key=None, panel_key=None,
+                    launcher_key=None):
+    """H2：Key 四级优先，返回 (effective_key, source)。
+
+    --api-key > API_KEY / QD_PROXY_KEY 环境变量 > 面板保存的 Key > 自动生成
+    的 launcher key。source ∈ KEY_SOURCES（none = 没有 Key）。
+
+    panel_key="" 表示「面板显式把 Key 清空」——它**优先于** launcher：否则一次
+    「清空 Key」会被启动时自动补生成偷偷抵掉。
+    """
+    if cli_key:
+        return cli_key, "cli"
+    if env_key:
+        return env_key, "env"
+    if panel_key is not None:
+        return panel_key, "panel"
+    if launcher_key:
+        return launcher_key, "launcher"
+    return None, "none"
+
+
+def panel_password_gate_error(bind_host, password_is_default, required=None):
+    """H4：默认面板密码 + 公网绑定 + 门控开启 → 返回拒启原因，否则 None。
+
+    只监听回环时不拦（本机用户自己承担）；QD_REQUIRE_PANEL_PASSWORD 默认 0，
+    与上游行为一致；容器编排显式设 1。
+    """
+    if required is None:
+        required = _env_flag("QD_REQUIRE_PANEL_PASSWORD")
+    if not required:
+        return None
+    if str(bind_host or "") != "0.0.0.0":
+        return None
+    if not password_is_default:
+        return None
+    return ("panel password is still the default 'admin' while binding 0.0.0.0:"
+            " anyone who can reach the port can log in and read the API key."
+            " Set a real password first, or run with QD_REQUIRE_PANEL_PASSWORD=0"
+            " to keep upstream behaviour.")
+
+
+def settings_file_mode(accounts_dir):
+    """accounts/settings.json 的权限位（int）；不存在 / 非 POSIX 返回 None。"""
+    if IS_WINDOWS:
+        return None
+    try:
+        st = os.stat(os.path.join(accounts_dir, "settings.json"))
+    except OSError:
+        return None
+    return st.st_mode & 0o777
+
+
+def _human_age(seconds):
+    """把秒数压成 3d / 2h / 5m / 12s（自检行用）。"""
+    try:
+        secs = max(0.0, float(seconds))
+    except (TypeError, ValueError):
+        return "-"
+    for suffix, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= size:
+            return "%d%s" % (int(secs // size), suffix)
+    return "%ds" % int(secs)
+
+
+def identity_selfcheck_line():
+    """H8 第四行：设备码形态 / legacy 开关 / UMID 组件与身份缓存年龄。
+
+    只报形状与来源，不打印任何身份值（machineId 由 uid 派生，但仍是可被关联
+    的稳定标识）。
+    """
+    shape, legacy = "unknown", -1
+    try:
+        import qoder_fingerprint
+        sample = qoder_fingerprint.derive_id("selfcheck", "machine")
+        legacy = 0 if sample.count("-") == 4 else 1
+        shape = "uuidv4" if legacy == 0 else "legacy-hex"
+    except Exception:
+        pass
+    umid = "unknown"
+    try:
+        exe = qoder_accounts.runtime_info_exe(CURRENT_REALM)
+        age = "-"
+        try:
+            cache = qoder_accounts.machine_identity_cache_path()
+            age = _human_age(time.time() - os.stat(cache).st_mtime)
+        except OSError:
+            pass
+        umid = "present(age=%s)" % age if exe else "missing"
+    except Exception:
+        pass
+    return "device_id=%s | legacy=%d | umid=%s" % (shape, legacy, umid)
+
+
+def startup_selfcheck_lines(host, port, key_source):
+    """H8：启动自检四行（不含任何敏感值，可直接进日志/采集器）。"""
+    mode = settings_file_mode(ACCOUNTS_DIR)
+    mode_text = format(mode, "o") if mode is not None else "missing"
+    try:
+        panel_default = 1 if qoder_settings.panel_password_is_default(
+            ACCOUNTS_DIR) else 0
+    except Exception:
+        panel_default = -1
+    try:
+        required = 1 if auth_required() else 0
+    except Exception:
+        required = -1
+    if host == "0.0.0.0":
+        if _in_container():
+            published, tls = "127.0.0.1:%d (expected)" % port, "external(nginx)"
+        else:
+            published, tls = "0.0.0.0:%d (all interfaces)" % port, "none"
+    else:
+        published, tls = "%s:%d (loopback only)" % (host, port), "none"
+    return [
+        "auth       : required=%d key_source=%s | panel_default=%d | "
+        "bind=%s:%d" % (required, key_source, panel_default, host, port),
+        "security   : settings.json mode=%s | updater=%s | sensitive_log=%d"
+        % (mode_text, "disabled" if UPDATE_DISABLED else "enabled",
+           int(sensitive_log())),
+        "ingress    : published=%s | tls=%s" % (published, tls),
+        "identity   : %s" % identity_selfcheck_line(),
+    ]
+
+
+def _key_origin_note(source, generated):
+    """LAN 横幅里 Key 的来源说明（H2：讲来源，不讲值）。"""
+    if source == "launcher":
+        return ("(newly generated & saved to accounts/settings.json)"
+                if generated else "(reused from accounts/settings.json)")
+    return {
+        "panel": "(from the panel settings - rotate it there)",
+        "env": "(from the API_KEY environment variable)",
+        "cli": "(from --api-key)",
+    }.get(source, "")
+
+
+def lan_banner_lines(ips, port, api_key, source="none", generated=False,
+                     sensitive=None, firewall_lines=()):
+    """LAN 启动横幅（H3）：默认只打印掩码 Key，且**不打印** ?key= URL。
+
+    QD_LOG_SENSITIVE=1 时恢复上游 v1.7.0 的原文（完整 Key + 带 ?key= 的看板
+    链接）——那是给个人桌面用户的便利开关；容器/公网部署必须保持 0。
+    """
+    if sensitive is None:
+        sensitive = sensitive_log()
+    ips = list(ips or []) or ["<this-pc-ip>"]
+    lines = ["", "  " + "=" * 62,
+             "  LAN MODE - reachable from other devices", ""]
+    for ip in ips:
+        lines.append("    API       : http://%s:%s/v1" % (ip, port))
+        lines.append("    Dashboard : http://%s:%s/" % (ip, port))
+    lines.append("")
+    lines.append("    API Key   : %s" % (mask_secret(api_key) if api_key
+                                       else "(none)"))
+    note = _key_origin_note(source, generated)
+    if note:
+        lines.append("                %s" % note)
+    lines.append("")
+    if sensitive:
+        lines.append("    Open the dashboard (key already included):")
+        lines.append("      http://%s:%s/?key=%s" % (ips[0], port, api_key))
+    else:
+        lines.append("    Open the dashboard: http://%s:%s/" % (ips[0], port))
+        lines.append("    The key is masked on purpose: log in to the panel and"
+                     " copy it")
+        lines.append("    from 设置 (QD_LOG_SENSITIVE=1 prints it in full, "
+                     "upstream style).")
+    lines.append("")
+    lines.append("    Clients: Base URL = the API address above, then paste "
+                 "the key.")
+    lines.append("")
+    lines.extend(firewall_lines)
+    if firewall_lines:
+        lines.append("")
+    lines.append("  " + "=" * 62)
+    lines.append("")
+    return lines
+
 
 def _empty_stats():
     return {"requests": 0, "errors": 0, "prompt_tokens": 0,
@@ -11297,22 +11517,11 @@ def main():
         print()
         return
 
-    API_KEY = args.api_key
     SYSTEM_PROMPT = args.system_prompt
     if args.accounts_dir:
         ACCOUNTS_DIR = os.path.abspath(args.accounts_dir)
-    # LAN 模式绝不能带默认密钥：网关花的是账号自己的上游额度，
-    # 可猜的默认值等于让全网段的人白嫖。首次生成一次并持久化。
-    if args.lan and not API_KEY:
-        API_KEY, API_KEY_GENERATED = qoder_settings.ensure_launcher_key(
-            ACCOUNTS_DIR)
-    # 面板保存的 Key 优先于自动生成的 LAN Key（.bat 重启后浏览器改动仍生效）；
-    # 命令行 --api-key 依然最高优先级。
-    global API_KEY_FILE_SET
-    saved_key, key_from_panel = qoder_settings.api_key_override(ACCOUNTS_DIR)
-    if key_from_panel and not args.api_key:
-        API_KEY = saved_key
-        API_KEY_FILE_SET = True
+    # 面板密码先处理：--panel-password 必须能在 H4 门控**之前**把默认密码换掉，
+    # 否则「用 --panel-password 修复」这条路径会被门控自己挡死。
     if args.panel_password:
         qoder_settings.set_panel_password(ACCOUNTS_DIR, args.panel_password)
         log("panel      : password set from --panel-password")
@@ -11324,6 +11533,49 @@ def main():
                 "anyone on this network can log in and read your API key. "
                 "Change it in the panel, or restart with --panel-password.",
                 level="WARN")
+    # H4：默认面板密码硬门控。面板跟着端口一起暴露时，默认 admin 等于把账号池
+    # 交出去；仅告警不足以构成「无安全回归」。默认关（与上游一致），编排显式开。
+    _gate = panel_password_gate_error(
+        args.host, qoder_settings.panel_password_is_default(ACCOUNTS_DIR))
+    if _gate:
+        log("SECURITY   : %s" % _gate, level="ERROR", tag="auth")
+        print()
+        print("  " + "=" * 62)
+        print("  REFUSING TO START - default panel password on a public bind")
+        print()
+        print("  %s" % _gate)
+        print()
+        print("  Fix (writes accounts/settings.json, mode 0600):")
+        print("    python -c \"import qoder_settings; "
+              "qoder_settings.set_panel_password(%r, '<new-password>')\""
+              % ACCOUNTS_DIR)
+        print("  Or start once with:  --panel-password <new-password>")
+        print("  Or, upstream-compatible (NOT recommended): "
+              "QD_REQUIRE_PANEL_PASSWORD=0")
+        print("  " + "=" * 62)
+        print()
+        sys.stdout.flush()
+        raise SystemExit(2)
+    # H2：Key 四级优先（--api-key > API_KEY/QD_PROXY_KEY > 面板保存 > launcher）。
+    # 只记录**来源**，值一律不打印（H3）。
+    _cli_key = args.api_key if _argv_has_option("--api-key") else None
+    _env_key = (os.environ.get("API_KEY") or os.environ.get("QD_PROXY_KEY")
+                or None)
+    # LAN 模式绝不能带默认密钥：网关花的是账号自己的上游额度，
+    # 可猜的默认值等于让全网段的人白嫖。首次生成一次并持久化。
+    _launcher_key = None
+    if args.lan and not args.api_key:
+        _launcher_key, API_KEY_GENERATED = qoder_settings.ensure_launcher_key(
+            ACCOUNTS_DIR)
+    # 面板保存的 Key 优先于自动生成的 LAN Key（.bat 重启后浏览器改动仍生效）；
+    # 命令行 --api-key 依然最高优先级。
+    global API_KEY_FILE_SET
+    saved_key, key_from_panel = qoder_settings.api_key_override(ACCOUNTS_DIR)
+    API_KEY, API_KEY_SOURCE = resolve_api_key(
+        cli_key=_cli_key, env_key=_env_key,
+        panel_key=saved_key if key_from_panel else None,
+        launcher_key=_launcher_key)
+    API_KEY_FILE_SET = API_KEY_SOURCE == "panel"
 
     POOL = qoder_accounts.AccountPool(ACCOUNTS_DIR, log=log)
     POOL.load()
@@ -11380,6 +11632,17 @@ def main():
                 level="WARN", tag="realm")
     except Exception:
         pass
+    # H5：settings.json 的权限（里面有 Key 明文）。save() 已经 chmod 0600，
+    # 这里只把「挂载目录/旧镜像带成 0644」这类外部原因变成启动时可见的 WARN。
+    _settings_mode = settings_file_mode(ACCOUNTS_DIR)
+    if _settings_mode is not None and _settings_mode != 0o600:
+        log("SECURITY   : %s mode=%o (expected 600) - the file stores the API "
+            "key in plaintext; run: chmod 600 %s"
+            % (qoder_settings.settings_path(ACCOUNTS_DIR), _settings_mode,
+               qoder_settings.settings_path(ACCOUNTS_DIR)), level="WARN")
+    # H8：启动自检四行（不含任何敏感值，可直接进采集器）。
+    for _line in startup_selfcheck_lines(args.host, args.port, API_KEY_SOURCE):
+        log(_line, tag="startup")
     from qoder_scheduler import Scheduler
     SCHEDULER = Scheduler(POOL)
     SCHEDULER.start()
@@ -11421,35 +11684,18 @@ def main():
 
     if args.host == "0.0.0.0":
         ips = local_ip_addresses() or ["<this-pc-ip>"]
-        print()
-        print("  " + "=" * 62)
-        print("  LAN MODE - reachable from other devices")
-        print()
-        for ip in ips:
-            print("    API       : http://%s:%s/v1" % (ip, args.port))
-            print("    Dashboard : http://%s:%s/" % (ip, args.port))
-        print()
-        print("    API Key   : %s" % API_KEY)
-        if API_KEY_GENERATED:
-            print("                (newly generated & saved to "
-                  "accounts/settings.json)")
-        else:
-            print("                (reused from accounts/settings.json)")
-        print()
-        print("    Open the dashboard (key already included):")
-        print("      http://%s:%s/?key=%s" % (ips[0], args.port, API_KEY))
-        print()
-        print("    Clients: Base URL = the API address above, then paste "
-              "the key.")
-        print()
         if IS_WINDOWS:
-            print("    If nothing can connect, allow python through the")
-            print("    firewall: run %s once as administrator." % FIREWALL_SCRIPT)
+            _fw = ["    If nothing can connect, allow python through the",
+                   "    firewall: run %s once as administrator."
+                   % FIREWALL_SCRIPT]
         else:
-            print("    If nothing can connect, open the port in the firewall")
-            print("    once:  sudo ./%s %d" % (FIREWALL_SCRIPT, args.port))
-        print("  " + "=" * 62)
-        print()
+            _fw = ["    If nothing can connect, open the port in the firewall",
+                   "    once:  sudo ./%s %d" % (FIREWALL_SCRIPT, args.port)]
+        # H3：横幅默认只打印掩码 Key，且不再打印 ?key= URL（上游会打印完整
+        # Key，容器日志一进 docker logs 就等于凭据泄露）。
+        for _line in lan_banner_lines(ips, args.port, API_KEY, API_KEY_SOURCE,
+                                      API_KEY_GENERATED, firewall_lines=_fw):
+            print(_line)
         sys.stdout.flush()
 
     if not POOL.accounts:
@@ -11501,8 +11747,8 @@ def main():
             print("          %s %d" % (START_SCRIPT, args.port + 1))
             print()
             raise SystemExit(1)
-    log("listening  : http://%s:%d/v1  (api key: %s)"
-        % (args.host, args.port, "on" if API_KEY else "off"))
+    log("listening  : http://%s:%d/v1  (api key: %s, source=%s)"
+        % (args.host, args.port, "on" if API_KEY else "off", API_KEY_SOURCE))
     log("dashboard  : http://%s:%d/" % (args.host, args.port))
     # 进程生命周期内保持 handler 引用：SetConsoleCtrlHandler 存的是裸指针，
     # 回调被 GC 会在关窗时崩溃。
