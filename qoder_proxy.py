@@ -44,6 +44,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import random
+import signal
 import uuid
 
 import qoder_accounts
@@ -8092,6 +8093,85 @@ def _responses_failed_frame(holder, code, message):
 # ---------------------------------------------------------------------------
 # HTTP layer
 # ---------------------------------------------------------------------------
+def _safe_server_shutdown(server):
+    """在工作线程里调 server.shutdown()：把 serve_forever 循环停下来。
+
+    SIGTERM 处理器本身在主线程里执行，直接调 shutdown() 会死锁
+    （shutdown 阻塞等循环退出，而循环被信号处理器打断着），所以
+    交给别的线程。异常一律吞掉——收尾路径不能比主流程更能决定生死。
+    """
+    try:
+        server.shutdown()
+    except Exception:
+        pass
+
+
+class QoderHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer + 活跃连接计数与优雅排空。
+
+    SIGTERM 时先停 listener，把优雅期留给真正在途的请求；空闲的
+    keep-alive 连接用 shutdown(SHUT_RD) 立即唤醒（EOF 即关闭），
+    不占优雅期。计数与 socket 集合都在 _conn_lock 下维护。
+    """
+
+    def __init__(self, server_address, RequestHandlerClass):
+        ThreadingHTTPServer.__init__(self, server_address, RequestHandlerClass)
+        self._active_connections = 0
+        self._conn_lock = threading.Lock()
+        self._live_sockets = set()
+
+    def active_connections(self):
+        with self._conn_lock:
+            return self._active_connections
+
+    def process_request(self, request, client_address):
+        with self._conn_lock:
+            self._active_connections += 1
+            self._live_sockets.add(request)
+        ThreadingHTTPServer.process_request(self, request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            try:
+                self.finish_request(request, client_address)
+                self.shutdown_request(request)
+            except Exception:
+                self.handle_error(request, client_address)
+                self.shutdown_request(request)
+        finally:
+            with self._conn_lock:
+                self._active_connections -= 1
+                self._live_sockets.discard(request)
+
+    def nudge_idle_connections(self):
+        """把卡在“读下一个请求行”的空闲 keep-alive 连接立即唤醒。
+
+        对已接受的 socket 调 shutdown(SHUT_RD)：对端没发数据时，服务端
+        阻塞的 recv 立刻返回 EOF，handle_one_request 据此关闭连接——
+        进程关闭因此不必为空闲连接空等整个优雅期。进行中的响应不受
+        影响（只动了读路径，写路径完好），优雅时间留给真正的在途请求。
+        """
+        with self._conn_lock:
+            sockets = list(self._live_sockets)
+        for sock in sockets:
+            try:
+                sock.shutdown(socket.SHUT_RD)
+            except Exception:
+                pass
+
+    def wait_connections_drained(self, timeout=10.0):
+        """优雅排空：等活跃连接归零或 timeout 到期（SIGTERM 优雅期）。"""
+        deadline = time.time() + max(0.0, float(timeout))
+        while True:
+            with self._conn_lock:
+                remaining = self._active_connections
+            if remaining <= 0:
+                return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.05)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     # Which configured API key the caller used, set by _key_ok(). Its bound
@@ -11010,7 +11090,7 @@ def main():
     server = None
     for _attempt in range(3):
         try:
-            server = ThreadingHTTPServer((args.host, args.port), Handler)
+            server = QoderHTTPServer((args.host, args.port), Handler)
             break
         except OSError as exc:
             _kind2 = classify_existing_instance(_probe_health(1.0))
@@ -11046,15 +11126,65 @@ def main():
     # 进程生命周期内保持 handler 引用：SetConsoleCtrlHandler 存的是裸指针，
     # 回调被 GC 会在关窗时崩溃。
     _ctrl_handler = install_console_close_handler()
+    # SIGTERM 优雅退出（docker stop / systemd 的默认信号）。
+    # 不能在信号处理器里直接调 server.shutdown()：它要阻塞到
+    # serve_forever 循环注意到关闭请求，而信号处理器正打断着主线程 ——
+    # 那是死锁。独立线程调，主线程从 serve_forever 正常返回后走 finally。
+    _shutdown_requested = {"flag": False}
+
+    def _on_sigterm(signum, frame):
+        if _shutdown_requested["flag"]:
+            return          # 重复 SIGTERM：不重复触发
+        _shutdown_requested["flag"] = True
+        log("SIGTERM received: stopping listener, draining in-flight requests",
+            level="WARN", tag="system")
+        threading.Thread(target=_safe_server_shutdown, args=(server,),
+                         name="qd-sigterm", daemon=True).start()
+
+    if os.name == "posix" and hasattr(signal, "SIGTERM"):
+        try:
+            signal.signal(signal.SIGTERM, _on_sigterm)
+        except (ValueError, OSError, RuntimeError):
+            pass            # 非主线程等极端情况：不拦启动
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        log("bye")
+        pass                # Ctrl+C：与 SIGTERM 同一套收尾
     finally:
+        # 1) 停调度器（先停周期性外部副作用）
+        try:
+            if SCHEDULER is not None:
+                SCHEDULER.stop()
+        except Exception as exc:
+            log("scheduler stop failed: %s" % exc, level="WARN")
+        # 2) 先唤醒空闲 keep-alive 连接（EOF），再把优雅时间全部留给
+        #    真正在途的请求（docker stop 默认 10s 后 SIGKILL，别空等）。
+        try:
+            server.nudge_idle_connections()
+        except Exception:
+            pass
+        # 3) 优雅期：docker stop 默认 10s 后 SIGKILL；QD_SHUTDOWN_GRACE 可调。
+        try:
+            _grace = float(os.environ.get("QD_SHUTDOWN_GRACE", "10") or 10)
+        except (TypeError, ValueError):
+            _grace = 10.0
+        try:
+            _drained = server.wait_connections_drained(_grace)
+        except Exception:
+            _drained = True
+        if not _drained:
+            try:
+                _left = server.active_connections()
+            except Exception:
+                _left = -1
+            log("grace period over: %d connection(s) still active, closing"
+                % _left, level="WARN")
+        # 4) 关监听 socket
         try:
             server.server_close()
         except Exception:
             pass
+        log("bye")
 
 
 if __name__ == "__main__":
