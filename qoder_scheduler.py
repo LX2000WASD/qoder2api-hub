@@ -22,12 +22,18 @@ import sys
 import threading
 import time
 
+import qoder_accounts
 import qoder_tasks
 from qoder_tasks import set_logger, run_batch_checkin, run_keepalive
 
 # 状态文件相对账号目录的子路径（避免被 AccountPool 读取为账号 JSON）
 STATE_SUBDIR = "scheduler"
 STATE_FILE_NAME = "state.json"
+# 跨进程 leader 锁文件名（与 state.json 同目录：accounts/scheduler/.leader.lock）
+LEADER_LOCK_NAME = ".leader.lock"
+
+# 状态落盘防抖窗口（秒）：日志/状态变更合并批量写盘，不再每条日志写一次。
+_STATE_DEBOUNCE = 2.0
 
 # 巡回来由：启动自动 / 整点排程 / 手动触发
 CYCLE_STARTUP = "startup"
@@ -56,6 +62,14 @@ class Scheduler(object):
                           or os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                           "accounts"))
         self._state_lock = threading.Lock()
+        # 防抖批量写盘（见 _save_state）：dirty 标记 + 上次刷盘时刻 + 兜底定时器
+        self._state_dirty = False
+        self._state_last_flush = 0.0
+        self._state_timer = None
+        # 跨进程 leader 锁（accounts/scheduler/.leader.lock）：持锁实例才执行
+        # 签到/额度刷新并写 state.json；同一进程内同线程可重入
+        self._leader_flock = qoder_accounts._named_flock(self._leader_lock_path())
+        self._is_leader = True           # 单实例默认就是 leader；竞争失败时置 False
         st = self._load_state()
         self.enabled = bool(st.get("enabled", True))   # 看板开关重启后仍生效
         self._apply_schedule(st)                        # issue #70：排程配置持久化
@@ -238,6 +252,29 @@ class Scheduler(object):
     def _state_path(self):
         return os.path.join(self.state_dir, STATE_SUBDIR, STATE_FILE_NAME)
 
+    def _leader_lock_path(self):
+        return os.path.join(self.state_dir, STATE_SUBDIR, LEADER_LOCK_NAME)
+
+    def _acquire_leader(self):
+        """尝试成为本轮巡检的 leader（非阻塞）；拿到返回 True。
+
+        同线程已持锁时直接复用（可重入）——trigger_now 与 tick 可能嵌套。
+        """
+        try:
+            if self._leader_flock.held_by_current_thread():
+                return True
+            got = bool(self._leader_flock.acquire(blocking=False))
+        except Exception:
+            got = True          # 锁坏了不能把巡检整体停摆：降级为单实例假设
+        self._is_leader = got
+        return got
+
+    def _release_leader(self):
+        try:
+            self._leader_flock.release()
+        except Exception:
+            pass
+
     def _load_state(self):
         """读状态文件；不存在/损坏都返回 {}（按全新进程处理）。"""
         try:
@@ -247,12 +284,53 @@ class Scheduler(object):
         except Exception:
             return {}
 
-    def _save_state(self):
-        """原子落盘（tmp + os.replace，同账号文件的写法）。失败只写 stderr。
+    def _save_state(self, force=False):
+        """落盘状态（**防抖批量**：窗口内的多次变更合并为一次写盘）。
+
+        · force=True 立即写（开关变更、补签闸门等 mark-before-act 场景）；
+        · 普通日志触发的写最多每 _STATE_DEBOUNCE 秒一次，窗口内挂一个定时
+          器兜底（不会再像旧实现那样每条日志都写一次盘）；
+        · **只有持锁（leader）实例写**：多实例时 state.json 是共享文件，
+          非持锁实例写会 last-write-wins 互相覆盖 leader 的视图。
 
         注意：本函数**不得**调用 self.log()，否则与 log→_save_state 形成递归。
         """
         with self._state_lock:
+            if not self._is_leader:
+                return
+            now = time.time()
+            self._state_dirty = True
+            if not force and (now - self._state_last_flush) < _STATE_DEBOUNCE:
+                self._arm_state_flush()
+                return
+            self._state_dirty = False
+            self._state_last_flush = now
+            self._write_state_file_locked()
+
+    def _arm_state_flush(self):
+        """挂一个兜底定时器：防抖窗口结束时把积攒的变更刷下去。"""
+        if self._state_timer is not None and self._state_timer.is_alive():
+            return
+        try:
+            timer = threading.Timer(_STATE_DEBOUNCE, self._flush_pending_state)
+            timer.daemon = True
+            self._state_timer = timer
+            timer.start()
+        except RuntimeError:
+            pass
+
+    def _flush_pending_state(self):
+        """定时器/stop 入口：把积攒的状态变更写盘。"""
+        with self._state_lock:
+            if not self._is_leader or not self._state_dirty:
+                return
+            self._state_dirty = False
+            self._state_last_flush = time.time()
+            self._write_state_file_locked()
+
+    def _write_state_file_locked(self):
+        """真正写盘（调用方必须已持 _state_lock）。失败只写 stderr。"""
+        if True:
             try:
                 path = self._state_path()
                 os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -305,6 +383,7 @@ class Scheduler(object):
     def stop(self):
         self._stop_event.set()
         self.log("后台定时调度器已暂停")
+        self._save_state(force=True)
 
     def _run_loop(self):
         # 启动后先休眠 10 秒等待主服务就绪，然后执行初次检查
@@ -357,10 +436,20 @@ class Scheduler(object):
         if not self._run_lock.acquire(blocking=False):
             self.log("跳过本次巡检 (%s)：上一轮仍在执行" % trigger_reason)
             return
+        # 跨进程互斥：签到/额度刷新这类**有副作用**的动作只允许一个实例执行，
+        # 否则多实例各自在 09:00/21:00 领取 = 重复领取（风控）。拿不到锁就跳过
+        # 本轮（不是排队），另一实例正在做同样的事。
+        if not self._acquire_leader():
+            self.log("跳过本次巡检 (%s)：另一实例持有 leader 锁" % trigger_reason)
+            self._run_lock.release()
+            return
         try:
             self._run_cycle(trigger_reason, cycle_kind)
         finally:
-            self._run_lock.release()
+            try:
+                self._release_leader()
+            finally:
+                self._run_lock.release()
 
     def _allow_complement_checkin(self, cycle_kind):
         """启动巡检的补签闸门：**同一天最多补签一次**（其余巡回来由不受限）。
@@ -376,7 +465,7 @@ class Scheduler(object):
         if self.startup_claim_date == today:
             return False
         self.startup_claim_date = today
-        self._save_state()
+        self._save_state(force=True)      # mark-before-act：必须先落盘再动作
         return True
 
     def _run_cycle(self, trigger_reason="周期巡检", cycle_kind=CYCLE_HOUR):
@@ -465,6 +554,7 @@ class Scheduler(object):
     def status(self):
         return {
             "enabled": self.enabled,
+            "is_leader": bool(self._is_leader),
             "checkin_times": self._fmt_times(self.checkin_times),
             "keepalive_times": self._fmt_times(self.keepalive_times),
             "cron": self.cron,

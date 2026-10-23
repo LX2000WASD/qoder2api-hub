@@ -31,6 +31,137 @@ import urllib.request
 from pathlib import Path
 import uuid
 
+# POSIX 跨进程文件锁（Windows 无 fcntl，_NamedFlock 会退化为进程内线程锁）
+try:
+    import fcntl as _fcntl
+except ImportError:                      # pragma: no cover - Windows
+    _fcntl = None
+
+# flock（LOCK_EX）把「读-改-写」在进程之间也串行化；同一进程内同一把锁
+# 按**线程**记账可重入（flock 作用在打开文件描述符上，同描述符重复加锁是
+# 幂等的）；同一进程的**其它线程**走真实 flock —— 与别的进程一样互斥
+# （trigger_now 与正在进行的巡检周期因此能正确看到「忙」）。
+_FLOCKS = {}                    # 锁路径 -> _NamedFlock（进程内全局唯一）
+_FLOCKS_LOCK = threading.Lock()
+
+
+class _NamedFlock(object):
+    """具名文件锁：fcntl.flock 排他锁 + 同线程可重入；Windows 退化为 RLock。
+
+    acquire(blocking=False) 拿不到锁返回 False（不抛异常），调用方据此
+    「跳过本次」而不是死等。
+    """
+
+    def __init__(self, path):
+        self.path = os.path.abspath(path)
+        self._depth = 0
+        self._owner = None
+        self._fh = None
+        self._guard = threading.Lock()
+        if _fcntl is None:               # Windows：进程内线程锁兜底
+            self._tk = threading.RLock()
+        else:
+            self._tk = None
+
+    def acquire(self, blocking=True):
+        ident = threading.get_ident()
+        with self._guard:
+            if self._depth > 0 and self._owner == ident:
+                self._depth += 1                  # 同线程重入：幂等
+                return True
+        if self._tk is not None:
+            got = self._tk.acquire(blocking)
+        else:
+            got = False
+            fh = None
+            try:
+                parent = os.path.dirname(self.path) or "."
+                os.makedirs(parent, exist_ok=True)
+                fh = open(self.path, "a+")
+                if blocking:
+                    _fcntl.flock(fh.fileno(), _fcntl.LOCK_EX)
+                    got = True
+                else:
+                    try:
+                        _fcntl.flock(fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                        got = True
+                    except OSError:
+                        got = False
+            except OSError:
+                got = False
+            if not got:
+                try:
+                    if fh is not None:
+                        fh.close()
+                except OSError:
+                    pass
+            else:
+                with self._guard:
+                    self._fh = fh
+                    self._owner = ident
+                    self._depth = 1
+                return True
+        if got:
+            with self._guard:
+                self._owner = ident
+                self._depth = 1
+        return got
+
+    def held_by_current_thread(self):
+        """当前线程是否已持有这把锁（用于可重入场景的「已在锁内」判定）。"""
+        with self._guard:
+            return self._depth > 0 and self._owner == threading.get_ident()
+
+    def release(self):
+        with self._guard:
+            ident = threading.get_ident()
+            if self._depth <= 0 or self._owner != ident:
+                return
+            self._depth -= 1
+            if self._depth > 0:
+                return
+            fh, self._fh, self._owner = self._fh, None, None
+        if self._tk is not None:
+            try:
+                self._tk.release()
+            except RuntimeError:
+                pass
+            return
+        if fh is not None:
+            try:
+                _fcntl.flock(fh.fileno(), _fcntl.LOCK_UN)
+            except (OSError, AttributeError):
+                pass
+            try:
+                fh.close()
+            except OSError:
+                pass
+
+    def __enter__(self):
+        self.acquire(blocking=True)
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+        return False
+
+
+def _named_flock(path):
+    """同一物理路径共享同一把锁（保证进程内重入记账生效）。"""
+    key = os.path.abspath(path)
+    with _FLOCKS_LOCK:
+        lk = _FLOCKS.get(key)
+        if lk is None:
+            lk = _NamedFlock(key)
+            _FLOCKS[key] = lk
+        return lk
+
+
+def _account_dir_flock(directory):
+    """账号目录的排他锁：<accounts>/.save.lock（Account.save 落盘用）。"""
+    return _named_flock(os.path.join(str(directory), ".save.lock"))
+
+
 from qoder_fingerprint import (derive_id, generate_request_id,
                                derive_machine_token, derive_machine_type,
                                vm_status)
