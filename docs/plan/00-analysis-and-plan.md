@@ -384,3 +384,45 @@ git fetch upstream --tags && git merge v1.7.0 && grep -rc '^<<<<<<< ' --include=
 - 上游 `qoder_updater.py:27 REPO = "shuishuipingan/qoder2api-hub"`。
 - 本地 `/v1/models` 无过滤（`qoder_proxy.py:6414-6430`）；闸门单点（6240-6249）。
 - 本地 `build_qoder_body` 只写 `max_tokens`/`reasoning_effort`（4001-4018）。
+---
+
+## 13. 执行状态（2026-10-23 20:15 更新）
+
+### 13.1 合流已完成（方案③）
+
+| 项 | 结果 |
+|---|---|
+| 新基线 | 上游 `v1.7.0`（ef900d7，89 提交）+ 本地 8 个重放提交 |
+| 分支 | `rebuild/v1.7.0` → 已 fast-forward 到 `main`（`d94a878`） |
+| 改动规模 | vs v1.7.0：18 文件，+1403/−165（含 124 行 leak_guard 套件） |
+| 测试 | **71 套件 / 1951 checks 全绿**（上游 70/1941 + 本地 1 套件） |
+| 版本 | `VERSION = "1.8.0"`（fork 版本，避免与上游 tag 撞名） |
+| 回滚点 | tag `backup/pre-v1.8-merge`、branch `backup/main-local` |
+| 历史 | `git merge -s ours main` 记录分叉，`docs/CHANGELOG-fork.md` 保 952 行本地历史 |
+
+重放批次：Batch-1 SIGTERM/排空 · Batch-2 连接上限/SSE 背压 · Batch-2.5 `/metrics`+`QD_LOG_JSON`+0600+`/readyz` · Batch-3 usage 按天轮转（9 处直读改链） · Batch-4 flock/leader/state 防抖 · Batch-5 非 root 镜像/CI/updater/pid/VERSION · Batch-6 文档与 `QD_SCHEDULER_ENABLED`。
+
+破坏性处理：`--lan` 保留（鉴权加固在 Wave 2）；`qoder_updater.REPO` → `LX2000WASD/qoder2api-hub`；`QD_UPDATE_DISABLE=1`；删 `qoder-proxy.pid` 并补 `.gitignore`；设备码切 UUIDv4（legacy 默认 0）。
+
+### 13.2 进行中（Wave 2）
+
+| 任务 | 内容 | 状态 |
+|---|---|---|
+| task-8 | `--lan` 鉴权加固 H1–H8（脱敏/门控/端口/settings 0600/updater/自检） | 进行中 |
+| task-9 | 运行时强化守卫套件 5–8 个（SIGTERM/背压/上限/flock/leader/轮转/metrics） | 进行中 |
+| task-12 | 补齐未重放能力（5min 轻保活/时区告警/scheduler property/Account flock） | 进行中 |
+
+### 13.3 待办（Wave 3+）
+
+- task-10 `QD_MINIMAL_BODY` + 影子统计（Q1）
+- task-11 模型闸门止血：面板保存丢白名单 + 别名归一 + `/v1/models` 过滤（Q3）
+- UMID 可持续性（HOME/hostname/token 年龄）与 shim 灰度（Q2，用户已批准）
+- 参数透传探针（Q4，用户已批准；本机无账号，需在上线窗口用 1 次真实调用验证 `temperature` 是否 400）
+- 上线：镜像 `v1.8.0`、运维文档同步（[06-ops-sync.md](06-ops-sync.md)）、24h 观测
+- 未做（等用户授权）：push、打 tag、GHCR 发布
+
+### 13.4 已知遗留
+
+- 合流分支未 push；发布渠道 GHCR 命名空间已指向 fork（`ghcr.io/lx2000wasd/...`），首次发布需确认权限。
+- 生产 compose 与仓库 compose 是两份：本次只改了仓库那份，上线时要按 `06-ops-sync.md` §3 同步 `/opt/qoder2api-hub`。
+- `/health` 免鉴权公开 version/账号数/risk 计数（无密钥）——是否对公网收敛，待拍板（ops 06 §6 Q8）。
