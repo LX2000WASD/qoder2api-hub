@@ -24,7 +24,10 @@ def git(args):
 
 
 def main():
-    if not os.path.isdir(os.path.join(ROOT, ".git")):
+    # linked worktree 里 .git 是文件不是目录（git worktree add 的产物），
+    # 用 rev-parse 判断才可靠：否则此门禁在 worktree 里会**静默空过**。
+    probe = git(["rev-parse", "--git-dir"])
+    if probe.returncode != 0:
         print("not a git checkout; clean-check skipped")
         return 0
     # 未知文件（??）：套件散落的证据。已跟踪文件的修改（M）不算——
