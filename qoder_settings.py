@@ -345,21 +345,33 @@ def _clean_model_patterns(value):
     return out
 
 
-def key_allows_model(entry, model):
+def key_allows_model(entry, model, aliases=()):
     """True = 该 Key 未设模型限制，或 model 命中它的 models 列表。
 
     - 空列表（或字段缺失）= 不受限（未碰过这个字段的安装行为不变）；
     - 受限 Key 且 model 为空 = **拒绝**（wb 同语义：空模型没有可判定依据，
       放行只会带着空模型白跑一趟上游）；
     - 匹配 fnmatch（大小写已在清洗时统一为小写），支持 gpt-4* 这类通配。
+    - **aliases**（2026 加固）：同一个模型的其它等价写法（上游 key / 官方
+      display_name / 「key (Name)」展示 id）。闸门与 /v1/models 先用
+      qoder_catalog 把名字归一，再把全部写法传进来——否则「白名单配
+      qmodel_38max、客户端写 Qwen3.8-Max」会被误拒。任一写法命中即放行。
     """
     patterns = _clean_model_patterns((entry or {}).get("models"))
     if not patterns:
         return True
+    # 受限 Key 且请求没写模型 = 拒绝，**不能**被 aliases 绕过（空模型没有可判定
+    # 依据，放行只会带空模型白跑一趟上游）。
     name = str(model or "").strip().lower()
     if not name:
         return False
-    return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
+    names = [name]
+    for candidate in aliases or ():
+        alias = str(candidate or "").strip().lower()
+        if alias and alias not in names:
+            names.append(alias)
+    return any(fnmatch.fnmatchcase(value, pattern)
+               for pattern in patterns for value in names)
 
 
 def banned_models(accounts_dir):

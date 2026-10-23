@@ -87,6 +87,29 @@ check("S5c 清空 = 恢复不封禁",
       _set_banned is not None and _set_banned(D, []) == []
       and _banned(D) == [], None)
 
+# ---- S6：别名归一（2026 加固）----
+# 语义：白名单 pattern 可以写成上游 key / 官方模型名 / 展示 id，判定时把同一个
+# 模型的全部等价写法都试一遍。裸调用（不传 aliases）保持旧语义 —— 正好证明
+# 「命中是因为归一」，不是断言写歪了。
+check("S6 白名单配上游 key + 客户端写官方名：裸调用仍拒绝、传 aliases 才命中",
+      _allows is not None
+      and _allows({"models": ["qmodel_38max"]}, "Qwen3.8-Max") is False
+      and _allows({"models": ["qmodel_38max"]}, "Qwen3.8-Max",
+                  aliases=["qmodel_38max", "qwen3.8-max"]) is True, None)
+check("S6b 别名里的 None/空串/重复项被忽略；空模型仍然拒绝（不许别名绕过）",
+      _allows is not None
+      and _allows({"models": ["qmodel_38max"]}, "Qwen3.8-Max",
+                  aliases=[None, "", "QMODEL_38MAX", "qmodel_38max"]) is True
+      and _allows({"models": ["qmodel_38max"]}, "",
+                  aliases=["qmodel_38max"]) is False
+      and _allows({"models": ["qmodel_38max"]}, None,
+                  aliases=["qmodel_38max"]) is False, None)
+check("S6c 客户端写展示 id（key (Name)）、白名单配上游 key -> 命中",
+      _allows is not None
+      and _allows({"models": ["qmodel_38max"]},
+                  "qmodel_38max (Qwen3.8-Max)",
+                  aliases=["qmodel_38max"]) is True, None)
+
 shutil.rmtree(D, ignore_errors=True)
 
 # ================= 接线层（G1-G8）：真 handler + 两层计数 =================
@@ -170,6 +193,11 @@ def _anthropic(model, key="plain-key-1234"):
                   "messages": [{"role": "user", "content": "hi"}]}, key)
 
 
+def _responses(model, key="plain-key-1234"):
+    _reset()
+    return _post("/v1/responses", {"model": model, "input": "hi"}, key)
+
+
 try:
     # G1 全局封禁（对不受限 key 也生效）-> 400 + 文案 + 两层计数 0
     S.set_banned_models(_G, "qwen3-max")
@@ -211,6 +239,64 @@ try:
     check("G8 /v1/messages 同覆盖：封禁模型 -> 400 + 两层计数 0",
           code == 400 and outbound["open"] == 0 and outbound["net"] == 0,
           (code, text[:140], dict(outbound)))
+    S.set_banned_models(_G, [])
+
+    # ---- G9-G14：别名归一（2026 加固）----
+    # 四种写法（上游 key / 官方模型名 / 小写别名 / 「key (Name)」）必须等价：
+    # 白名单不管写成哪种，客户端不管写哪种，判定都一致。
+    S.set_api_keys(_G, [
+        {"id": "gate1", "name": "闸门Key", "key": "gate-key-1234",
+         "models": ["qmodel_38max"]},
+        {"id": "plain1", "name": "不受限Key", "key": "plain-key-1234"},
+    ])
+    code, text = _chat("Qwen3.8-Max", key="gate-key-1234")
+    check("G9 白名单配上游 key + 客户端写官方模型名 -> 放行（open >= 1）",
+          outbound["open"] >= 1, (code, text[:120], dict(outbound)))
+
+    S.set_api_keys(_G, [
+        {"id": "gate1", "name": "闸门Key", "key": "gate-key-1234",
+         "models": ["qwen3.8-max"]},
+        {"id": "plain1", "name": "不受限Key", "key": "plain-key-1234"},
+    ])
+    code, text = _chat("qmodel_38max", key="gate-key-1234")
+    check("G10 白名单配官方模型名 + 客户端写上游 key -> 放行（open >= 1）",
+          outbound["open"] >= 1, (code, text[:120], dict(outbound)))
+
+    S.set_api_keys(_G, [
+        {"id": "gate1", "name": "闸门Key", "key": "gate-key-1234",
+         "models": ["qmodel_38max"]},
+        {"id": "plain1", "name": "不受限Key", "key": "plain-key-1234"},
+    ])
+    code, text = _chat("qmodel_38max (Qwen3.8-Max)", key="gate-key-1234")
+    check("G10b 展示 id 形态（key (Name)）同样命中白名单（open >= 1）",
+          outbound["open"] >= 1, (code, text[:120], dict(outbound)))
+
+    S.set_api_keys(_G, [
+        {"id": "gate1", "name": "闸门Key", "key": "gate-key-1234",
+         "models": ["gpt-4*"]},
+        {"id": "plain1", "name": "不受限Key", "key": "plain-key-1234"},
+    ])
+    code, text = _chat("Qwen3.8-Max", key="gate-key-1234")
+    check("G11 白名单外（用官方模型名请求）-> 400 + 模型限制 + 两层计数 0",
+          code == 400 and "模型限制" in text and outbound["open"] == 0
+          and outbound["net"] == 0, (code, text[:140], dict(outbound)))
+
+    S.set_banned_models(_G, "Qwen3.8-Max")
+    code, text = _chat("qmodel_38max")
+    check("G12 封禁表写官方模型名、客户端写上游 key -> 400（归一后封得住）",
+          code == 400 and "封禁" in text and outbound["open"] == 0
+          and outbound["net"] == 0, (code, text[:140], dict(outbound)))
+
+    code, text = _responses("Qwen3.8-Max")
+    check("G13 /v1/responses 同覆盖：封禁模型 -> 400 + 两层计数 0（此前无用例）",
+          code == 400 and "封禁" in text and outbound["open"] == 0
+          and outbound["net"] == 0, (code, text[:140], dict(outbound)))
+
+    S.set_banned_models(_G, [])
+    code, text = _responses("qmodel_38max")
+    check("G14 对照组：/v1/responses 未封禁 -> 放行到出站口（open >= 1）",
+          outbound["open"] >= 1, (code, dict(outbound)))
+
     S.set_banned_models(_G, [])
 finally:
     try:
