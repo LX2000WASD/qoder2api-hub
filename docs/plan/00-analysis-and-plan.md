@@ -433,11 +433,23 @@ git fetch upstream --tags && git merge v1.7.0 && grep -rc '^<<<<<<< ' --include=
 5. **设备码**：UUIDv4 形态、`QD_DEVICE_ID_LEGACY` 默认 0——对上游等于换一次设备（用户已拍板直接切）。
 6. **usage**：写入 `usage-YYYY-MM-DD.jsonl`（UTC+8），备份/清理脚本要按组文件处理；v1.7.0 的 `pricing-overrides.json` 也建议纳入备份。
 
-### 13.5 仍待办
+### 13.5 上线结果（2026-10-23 22:31）
 
-- **参数透传探针**（Q4，用户已批准）：本机无账号凭据，需在上线窗口用 1 次真实调用验证 `temperature` 是否被上游 400；通过后再灰度 `QD_PARAM_PASSTHROUGH`。
-- **shim 灰度观测**（Q2，用户已批准）：默认关，只在容器内做观测；服务端是否反查 token 仍未验证。
-- **上线窗口**：构建镜像 `v1.8.0`、按 [06-ops-sync.md](06-ops-sync.md) 更新阿里云运维文档、执行 24h 观测清单（usage 非零/失败行三字段/10605 等待/设备码形态）。
-- **等授权**：push、打 tag、GHCR 发布——均未执行。
-- **小遗留**：`tests/README.md` 套件表未补新套件；`_verify_models.py` 默认视图看不到 `enable=false` 模型（可加 `?all=1`）；排空窗口无显式 503；`QD_SSE_QUEUE_SIZE`/`QD_MAX_CONNECTIONS` 填非法值会 fail-fast 但缺友好提示；`/health` 是否对公网收敛待拍板。
-- **生产 compose 与仓库 compose 是两份**：本次只改仓库那份，上线时按 06 §3 同步 `/opt/qoder2api-hub`。
+| 项 | 值 |
+|---|---|
+| 推送 | `main` `e8b7885`（v1.8.0）→ `543702e`（v1.8.1）；tag `v1.8.0`/`v1.8.1` 已推送 |
+| CI | tests（3 OS × py）与 Build Docker image 均 **success**（首轮 Windows 红已修） |
+| 镜像 | `qoder2api-hub:v1.8.1`（sha256 `df2803bb…`，67.1 MB，服务端本地构建） |
+| 生产 | ECS `/opt/qoder2api-hub`，host 网络只听 `127.0.0.1:8790`，`v1.4` → `v1.8.1`，RestartCount 0，healthy |
+| 生产 compose | 保留 `API_KEY` 强制鉴权；**故意不用 `--lan`**（host 网络下会绑 0.0.0.0）；新增 `umid-home` 卷与 `QD_UPDATE_DISABLE=1` |
+| 验证 | `/health` version=1.8.1 / 6 账号 ready；公网双域名 `/ping` 200；未带 Key `/v1/models` 401；chat/messages/responses 全 200（缓存命中 2593）；日志每行合法 JSON、完整 Key 命中 0；面板登录 200 |
+| 运维文档 | 新增 `32-qoder2api-hub-v1.8.1上线记录-2026-10-23.md`，并更新 `01/02/04/06/README` |
+| 回滚 | compose 备份 + `accounts` tar + 旧镜像 `v1.4`（30 秒可回） |
+
+### 13.6 仍待办
+
+- **参数探针结论**：已在生产容器内直接构造上游请求体注入 `parameters.temperature=0.5/top_p=0.9` → **HTTP OK、无错误信封**；可以安全实现 `QD_PARAM_PASSTHROUGH`（开关灰度）。
+- **shim 灰度观测**（Q2，用户已批准）：默认关，只在容器内观测；服务端是否反查 token 仍未验证。
+- **`QD_MINIMAL_BODY` 灰度**：默认 0，建议观察 1–2 天后开 1，并按 `prompt_src` 对比行为与 credits。
+- **24h 观测**：usage 非零、失败行三字段、10605 等待、risk 计数、日志体积、设备码形态（见 `06-ops-sync.md` §3.5）。
+- **小遗留**：`tests/README.md` 套件表未补新套件；`_verify_models.py` 默认视图看不到 `enable=false` 模型（可加 `?all=1`）；排空窗口无显式 503；`QD_SSE_QUEUE_SIZE`/`QD_MAX_CONNECTIONS` 非法值 fail-fast 缺友好提示；`/health` 是否对公网收敛待拍板。
