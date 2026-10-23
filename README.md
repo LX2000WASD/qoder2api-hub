@@ -58,6 +58,10 @@ cd qoder2api-hub
 > Docker 以局域网模式启动，会强制使用 API Key。首次启动时自动生成，用 `docker compose logs qoder-proxy | grep -i "api key"` 查看。
 > 局域网共享、改端口、出口代理见[部署](docs/deployment.md)。
 
+> **官方提示词兜底**：请求里没有 system 消息时，网关默认会用官方 Qoder 提示词补齐（约 12 KB）。
+> 设 `QD_MINIMAL_BODY=1` 可改为不注入，适合把网关当作通用模型 API 使用；客户端 system 与
+> `--system-prompt` 的语义不变。开关、观测字段与灰度建议见[配置参考 · 请求改写](docs/configuration.md#请求改写)。
+
 ## 接入客户端
 
 | 客户端 | Base URL | 协议 |
