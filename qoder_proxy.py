@@ -2259,10 +2259,37 @@ def add_log_entry(msg, level=None, tag=None):
     return entry
 
 
+# stdout 单行写锁：多线程并发 log() 时避免 JSON 行/人类行交错半行。
+_LOG_WRITE_LOCK = threading.Lock()
+
+
+def _env_flag(name):
+    """env 开关归一：1/true/yes/on（大小写不敏感）为开。"""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+_LOG_JSON = _env_flag("QD_LOG_JSON")
+
+
 def log(msg, level=None, tag=None):
-    sys.stderr.write("[qd-proxy] %s %s\n" % (time.strftime("%H:%M:%S"), msg))
-    sys.stderr.flush()
-    add_log_entry(msg, level=level, tag=tag)
+    """记一行日志。默认人类格式（stderr）；QD_LOG_JSON=1 时 stdout 输出
+    结构化 JSON 行（ts/level/msg/tag/id，机器可读），采集器直接解析。
+
+    两种格式共用同一份 LOG_BUFFER（面板 /logs 读的就是它）。
+    """
+    entry = add_log_entry(msg, level=level, tag=tag)
+    if _LOG_JSON:
+        # stdout 给采集器（单行 JSON），stderr 不再重复。
+        line = json.dumps({"ts": entry["ts"], "level": entry["level"],
+                           "tag": entry["tag"], "msg": entry["msg"],
+                           "id": entry["id"]}, ensure_ascii=False)
+        with _LOG_WRITE_LOCK:
+            sys.stdout.write(line + "\\n")
+            sys.stdout.flush()
+        return
+    with _LOG_WRITE_LOCK:
+        sys.stderr.write("[qd-proxy] %s %s\n" % (entry["time"], msg))
+        sys.stderr.flush()
 
 
 def get_logs(limit=200, level="", tag="", search="", since_id=0):
@@ -8200,6 +8227,31 @@ class QoderHTTPServer(ThreadingHTTPServer):
             time.sleep(0.05)
 
 
+def _pool_ready_count():
+    """池中就绪账号数（/readyz 与 /health 的判定同源）。
+
+    防御式：POOL 可能为 None（纯库使用/测试），或被测试桩替换成没有
+    count_ready 的对象——此时按 0 计，就绪探针返回 503（保守，不抛异常）。
+    """
+    try:
+        return int(POOL.count_ready() or 0) if POOL else 0
+    except Exception:
+        return 0
+
+
+def _pool_cooling_count():
+    """处于冷却的账号数（/metrics 观测用，就绪的反面不必然等于它）。"""
+    try:
+        if not POOL or not getattr(POOL, "accounts", None):
+            return 0
+        now = time.time()
+        return sum(1 for a in POOL.accounts
+                   if getattr(a, "cooldown_until", 0.0)
+                   and float(a.cooldown_until or 0.0) > now)
+    except Exception:
+        return 0
+
+
 def _reject_overloaded_connection(request):
     """超上限连接的越界应答：不经 Handler 线程，裸写一个完整响应即关。"""
     body = json.dumps({"error": {
@@ -8382,6 +8434,62 @@ class Handler(BaseHTTPRequestHandler):
         extra = {"Retry-After": int(retry_after)} if retry_after else None
         self._json(code, {"error": {"message": message, "type": err_type,
                                     "code": code}}, extra_headers=extra)
+
+    def _prometheus_metrics(self):
+        """/metrics：Prometheus 文本格式（账号池 / 上游错误 / 线程 / usage 概要）。
+
+        只追加观测面，不改任何既有路由。单进程内存口径（与 /health 的
+        accounts_ready 同源）；counter 类指标由采集器自行累积速率。
+        """
+        lines = []
+
+        def metric(name, kind, value, help_text):
+            lines.append("# HELP %s %s" % (name, help_text))
+            lines.append("# TYPE %s %s" % (name, kind))
+            lines.append("%s %s" % (name, value))
+
+        try:
+            total_accounts = len(POOL.accounts) if POOL else 0
+        except Exception:
+            total_accounts = 0
+        metric("qoder_accounts_total", "gauge", total_accounts,
+               "Total accounts in the pool")
+        metric("qoder_accounts_ready", "gauge", _pool_ready_count(),
+               "Accounts currently able to serve")
+        metric("qoder_accounts_cooling", "gauge", _pool_cooling_count(),
+               "Accounts in cooldown")
+        with _lock:
+            errors = int(_usage["errors"] or 0)
+            requests = int(_usage["requests"] or 0)
+            prompt_tokens = int(_usage["prompt_tokens"] or 0)
+            completion_tokens = int(_usage["completion_tokens"] or 0)
+            total_tokens = int(_usage["total_tokens"] or 0)
+        metric("qoder_upstream_errors_total", "counter", errors,
+               "Failed upstream requests since process start")
+        metric("qoder_requests_total", "counter", requests,
+               "Requests recorded since process start")
+        metric("qoder_prompt_tokens_total", "counter", prompt_tokens,
+               "Prompt tokens served since process start")
+        metric("qoder_completion_tokens_total", "counter", completion_tokens,
+               "Completion tokens served since process start")
+        metric("qoder_total_tokens_total", "counter", total_tokens,
+               "All tokens (in+out) since process start")
+        metric("qoder_active_threads", "gauge", threading.active_count(),
+               "Live threads in this process")
+        active_conn = getattr(self.server, "active_connections", None)
+        if callable(active_conn):
+            metric("qoder_active_connections", "gauge", int(active_conn()),
+                   "Open client connections (cap: QD_MAX_CONNECTIONS)")
+        body = ("\n".join(lines) + "\n").encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type",
+                         "text/plain; version=0.0.4; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        if cors_origin_allowed(self.path):
+            self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
 
     def _unknown_path_error(self, path):
         """404，并针对最常见的「接入地址填错」给出可执行提示。
@@ -8653,6 +8761,12 @@ class Handler(BaseHTTPRequestHandler):
             # 极简探活端点：**不需要面板密码/API Key、不查账号池**。
             # 客户端/守护脚本常用 GET /ping 判活，之前返回 404 会被判成
             # “网关不可用” → 反复重连。这里返回纯文本 pong。
+            if path == "/readyz" and _pool_ready_count() <= 0:
+                # /readyz 是就绪探针（例外）：一个就绪账号都没有时返 503，
+                # 让 docker/k8s 摘流；liveness（/ping /livez /healthz）仍
+                # 返纯 pong——“活着但不能服务”与“死了”必须区分开。
+                return self._error(503, "no ready account in the pool",
+                                   "server_error")
             body = b"pong\n"
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -8746,6 +8860,11 @@ class Handler(BaseHTTPRequestHandler):
                     "expires_at": rep.expires_at if rep else None,
                 })
             return self._json(200, info)
+        if path == "/metrics":
+            # Prometheus 文本格式（新增路由，既有路由一律不动）：
+            # 与 /health 同级开放（不查面板密码/API Key），采集器零配置
+            # 直连；要加认证在反代层挡即可。
+            return self._prometheus_metrics()
         if path == "/realm":
             # #26：面板需要知道「自动路由是否开着」——mode 由 auto_enabled + current
             # 推导：自动开 = 未显式指定时会按模型/账号可用性兜底换区；否则恒用 current。

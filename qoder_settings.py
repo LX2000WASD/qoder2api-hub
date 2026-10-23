@@ -7,6 +7,7 @@ password is never stored in clear text - only a PBKDF2-SHA256 digest.
 Only the Python standard library is required.
 """
 
+import copy
 import fnmatch
 import hashlib
 import hmac
@@ -24,6 +25,9 @@ SESSION_TTL = 7 * 24 * 3600
 
 _lock = threading.RLock()
 
+# settings.json 读缓存：<绝对路径> -> (mtime_ns, size, data)。save() 写后失效。
+_settings_cache = {}
+
 
 def settings_path(accounts_dir):
     return os.path.join(accounts_dir, "settings.json")
@@ -35,23 +39,50 @@ def _digest(password, salt_hex, rounds=PBKDF2_ROUNDS):
     ).hex()
 
 
+def _cache_key(accounts_dir):
+    return os.path.abspath(settings_path(accounts_dir))
+
 def load(accounts_dir):
-    """Return the persisted settings, or an empty dict on a fresh install."""
+    """Return the persisted settings, or an empty dict on a fresh install.
+
+    match_api_key 每个请求都调这里：全量 json.load 一次解析几百微秒，
+    高并发下并不便宜。命中 (mtime_ns, size) 未变时直接返回缓存深拷贝——
+    安全语义不变（key 比较仍在 hmac.compare_digest 里做），只是少读盘。
+    深拷贝必须：调用方习惯就地改 dict 再 save()，共享引用会污染缓存。
+    """
     path = settings_path(accounts_dir)
+    try:
+        st = os.stat(path)
+    except OSError:
+        with _lock:
+            _settings_cache.pop(_cache_key(accounts_dir), None)
+        return {}
+    key = _cache_key(accounts_dir)
+    with _lock:
+        hit = _settings_cache.get(key)
+        if hit is not None and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+            return copy.deepcopy(hit[2])
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
-        if isinstance(data, dict):
-            return data
-    except FileNotFoundError:
-        pass
+        st_after = os.stat(path)   # 读穿防护：读期间被改的这一次不进缓存
     except Exception:
-        pass
-    return {}
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    if st_after.st_mtime_ns == st.st_mtime_ns and st_after.st_size == st.st_size:
+        with _lock:
+            _settings_cache[key] = (st.st_mtime_ns, st.st_size, data)
+    return copy.deepcopy(data)
 
 
 def save(accounts_dir, data):
-    """Atomic write so a crash cannot leave a half-written settings file."""
+    """Atomic write so a crash cannot leave a half-written settings file.
+
+    临时文件先 chmod 0600 再 rename：跟随 umask 会落 0644，而 settings.json
+    里是 API key 明文——同机任何用户都不该读。写完作废读缓存（下一次
+    load 重新读盘，同进程内的其它读者立即看到新值）。
+    """
     with _lock:
         base = Path(accounts_dir).resolve()
         base.mkdir(parents=True, exist_ok=True)
@@ -61,7 +92,10 @@ def save(accounts_dir, data):
             raise ValueError("path escapes base directory")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2),
                        encoding="utf-8")
+        os.chmod(tmp, 0o600)
         os.replace(tmp, path)
+        _settings_cache.pop(_cache_key(accounts_dir), None)
+        _settings_cache.pop(str(path), None)
         return str(path)
 
 
