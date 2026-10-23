@@ -41,6 +41,16 @@ CYCLE_HOUR = "hour"
 CYCLE_MANUAL = "manual"
 
 
+def scheduler_disabled_by_env():
+    """QD_SCHEDULER_ENABLED=off/0/false/no -> 整体关闭调度器（线程不启动）。
+
+    没有这个开关时，只想「先不自动签到」的用户只能改代码或断网；环境变量是
+    容器部署里最省事的闸门（与 QD_TRAFFIC_GUARD 等同一风格）。
+    """
+    value = (os.environ.get("QD_SCHEDULER_ENABLED") or "on").strip().lower()
+    return value in ("off", "0", "false", "no", "disable", "disabled")
+
+
 class Scheduler(object):
     def __init__(self, pool, state_dir=None):
         self.pool = pool
@@ -374,6 +384,9 @@ class Scheduler(object):
 
     def start(self):
         if self._thread and self._thread.is_alive():
+            return
+        if scheduler_disabled_by_env():
+            self.log("调度器已被 QD_SCHEDULER_ENABLED=off 整体关闭（线程不启动）")
             return
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)

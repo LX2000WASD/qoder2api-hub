@@ -207,6 +207,7 @@ python qoder_proxy.py [--host HOST] [--port PORT] [--lan] [--api-key KEY]
 | `QD_SSE_QUEUE_SIZE` | `16` | SSE 读线程→主线程有界队列容量（背压传导到上游） |
 | `QD_SSE_IDLE_LIMIT` | `900` | 单次等待上游数据的上限（秒），超过抛 TimeoutError |
 | `QD_CONNECTION_TIMEOUT` | `120` | 空闲 keep-alive 连接的 socket 超时（秒） |
+| `QD_SCHEDULER_ENABLED` | `on` | `off/0/false/no` 时调度器线程**不启动**（临时停自动签到/保活，不改代码） |
 
 ### 用量流水
 
