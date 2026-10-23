@@ -404,18 +404,24 @@ def desktop_install_dir(realm):
 def runtime_info_exe(realm):
     """定位 runtime-info 原生风控身份桥；找不到返回空串。
 
-    查找顺序（先桌面客户端，再提取目录）：
+    查找顺序（先桌面客户端，再提取目录，**shim 整体优先于两者**）：
+      0. QD_UMID_SHIM 指定的 shim（灰度开关，默认关；见 umid_shim_path）；
       1. <桌面客户端安装目录>/{resources,Resources}/umid/runtime-info[.exe]；
-      2. 提取目录 $QD_UMID_DIR、<repo>/umid：
-         - Windows：runtime-info.exe（需同目录存在 sgsdk.dll）；
-         - POSIX：runtime-info（由 _install_umid.py 提取）。
+      2. 提取目录 $QD_UMID_DIR、<repo>/umid。
 
-    可用 QD_NATIVE_IDENTITY=0 关闭（测试/受限环境不希望拉起客户端二进制时）。
+    可用 QD_NATIVE_IDENTITY=0 关闭（测试/受限环境不希望拉起客户端二进制时；
+    它是**总开关**，设 0 时连 shim 也不走）。
     """
     if (os.environ.get("QD_NATIVE_IDENTITY") or "1").strip() in ("0", "false", "no"):
         return ""
     if realm in _native_exe_cache:
         return _native_exe_cache[realm]
+    shim = umid_shim_path()
+    if shim:
+        # shim 是显式灰度开关：命中即用，不再探测桌面端/提取目录。
+        _log_shim_active(shim)
+        _native_exe_cache[realm] = shim
+        return shim
     found = ""
     inst_dir = desktop_install_dir(realm)
     if inst_dir:
@@ -539,6 +545,155 @@ def run_runtime_info(realm, account_id=""):
     return {}
 
 
+# ---------------------------------------------------------------------------
+# UMID 可持续性自检 + shim 灰度（Q2，docs/plan/02-vm-identity.md §4）
+# ---------------------------------------------------------------------------
+# 背景（实测，见 docs/plan/02-vm-identity.md §2.1）：runtime-info 是阿里 UMID
+# 的**联网注册客户端**——machineToken 由服务端签发，注册缓存落在 passwd home 的
+# ~/.config/.locale_cfg（350B）。容器里 adduser -H 不建 home 时该路径不可写，
+# 每次调用都会重新注册（token 每次都变），只能靠 accounts/machine_identity.json
+# 兜底。镜像侧改用 adduser -h /app/home + ENV HOME=/app/home 修掉（见 Dockerfile）。
+#
+# 本段落只做三件事，全部**不执行组件、不联网、不含任何 token**：
+#   1. QD_UMID_SHIM 灰度开关（默认关）；
+#   2. umid_status()：present / source / shim_active / token_age / vm_brand；
+#   3. 启动自检一行日志（AccountPool 构造期调用）。
+_shim_logged = set()
+
+
+def _log_shim_active(path):
+    """shim 命中时在 stderr 打一次 shim_active=1（同路径进程内只打一次）。"""
+    key = str(path)
+    if key in _shim_logged:
+        return
+    _shim_logged.add(key)
+    try:
+        print("[umid] shim_active=1 path=%s（QD_UMID_SHIM 灰度开关；"
+              "服务端可能反查 token，未验证，勿用于生产伪装）" % key,
+              file=sys.stderr)
+    except Exception:
+        pass
+
+
+def umid_shim_path():
+    """QD_UMID_SHIM 指向的 shim 可执行文件；未设置/不可用返回空串。
+
+    契约与官方 runtime-info 一致：argv 为环境码（0=国内 / 3=国际），darwin/win32
+    且有 account 时再加 --account-stdin，stdin 是 {"account": "<uid>"} 加换行，
+    stdout 单行 JSON（machineToken/machineType/machineCode[/vmInfo]）。
+
+    **默认关**：不设置该变量时行为与上游完全一致。设了但文件不存在/无执行权限
+    时按「未设置」处理并 WARN 一次（不阻断启动、不静默吞掉配置错误）。
+    """
+    raw = (os.environ.get("QD_UMID_SHIM") or "").strip()
+    if not raw:
+        return ""
+    path = os.path.abspath(os.path.expanduser(raw))
+    if not os.path.isfile(path):
+        _runtime_info_warn(
+            "shim-missing",
+            "QD_UMID_SHIM=%s 不存在，按未设置处理（身份仍走原生桥/派生）" % raw)
+        return ""
+    if os.name != "nt" and not os.access(path, os.X_OK):
+        _runtime_info_warn(
+            "shim-noexec",
+            "QD_UMID_SHIM=%s 没有执行权限（chmod +x），按未设置处理" % raw)
+        return ""
+    return path
+
+
+def _fmt_age(seconds):
+    """秒 -> 3d / 2h / 5m / 12s（自检行展示用）；None/非法 -> '-'。"""
+    try:
+        secs = max(0.0, float(seconds))
+    except (TypeError, ValueError):
+        return "-"
+    for suffix, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= size:
+            return "%d%s" % (int(secs // size), suffix)
+    return "%ds" % int(secs)
+
+
+def umid_status(realm=None):
+    """UMID 组件自检（**只读，不含任何 token 内容**）。
+
+    数据来源全部是「路径 + 环境变量 + 落盘缓存」，**不执行组件、不联网**，
+    所以可以在启动路径安全调用（测试里反复构造账号池也不会拉起二进制）。
+
+    返回：
+      present         bool   组件/shim 是否可用
+      source          str    "shim" | "native" | "none"
+      shim_active     bool   本次是否走 QD_UMID_SHIM
+      umid_exe        str    组件路径（空=缺失）
+      identity_cached bool   accounts/machine_identity.json 里有该 realm 的可用身份
+      token_age_s     float|None  该身份缓存至今秒数（无缓存= None）
+      token_age       str    人类可读年龄（2h / 5m / -）
+      vm_brand        str    缓存里的 vmInfo.brand（如 KVM / Docker；无缓存=""）
+      vm_type_code    int|None 缓存里的 vmInfo.vmTypeCode
+      is_vm           bool|None 缓存里的 vmInfo.isVm
+      environment     str    缓存条目记录的环境码（cn=0 / intl=3）
+    """
+    r = realm if realm in ("cn", "intl") else "cn"
+    shim = umid_shim_path()
+    exe = runtime_info_exe(r)
+    present = bool(exe)
+    entry = (_read_identity_cache_doc().get("realm") or {}).get(r) or {}
+    ident = _identity_entry_to_ident(entry) if entry else None
+    age = None
+    try:
+        if entry:
+            age = max(0.0, time.time() - float(entry.get("cached_at") or 0))
+    except (TypeError, ValueError):
+        age = None
+    vm = entry.get("vm_info") if isinstance(entry.get("vm_info"), dict) else {}
+    vm_type_code = vm.get("vmTypeCode")
+    try:
+        vm_type_code = int(vm_type_code) if vm_type_code is not None else None
+    except (TypeError, ValueError):
+        vm_type_code = None
+    return {
+        "present": present,
+        "source": "shim" if shim else ("native" if present else "none"),
+        "shim_active": bool(shim),
+        "umid_exe": exe or "",
+        "identity_cached": ident is not None,
+        "token_age_s": age,
+        "token_age": _fmt_age(age),
+        "vm_brand": str(vm.get("brand") or ""),
+        "vm_type_code": vm_type_code,
+        "is_vm": bool(vm.get("isVm")) if "isVm" in vm else None,
+        "environment": str(entry.get("environment") or ""),
+    }
+
+
+def _log_umid_startup(log=None):
+    """启动自检一行：present / source / shim_active / token_age / vm_brand。
+
+    与 /diag/vm 同源（都基于 umid_status 的缓存视图），但**不执行组件**：
+    容器启动时不额外付出一次 UMID 注册（可能 0.3~25s）的代价。
+    """
+    try:
+        st = umid_status()
+    except Exception:
+        return None
+    line = ("umid: present=%s source=%s shim_active=%d token_age=%s "
+            "vm_brand=%s vm_type_code=%s" % (
+                "yes" if st["present"] else "no",
+                st["source"],
+                1 if st["shim_active"] else 0,
+                st["token_age"],
+                st["vm_brand"] or "-",
+                "-" if st["vm_type_code"] is None else st["vm_type_code"]))
+    try:
+        if log is not None:
+            log(line)
+        else:
+            print("[umid] " + line, file=sys.stderr)
+    except Exception:
+        pass
+    return st
+
+
 _vm_cache = {}
 
 
@@ -558,6 +713,14 @@ def local_vm_status(realm=None, force=False):
     st = vm_status(bridge_vm_info=vm_info, bridge_available=bool(runtime_info_exe(r)))
     st["realm"] = r
     st["bridge_available"] = bool(runtime_info_exe(r))
+    # Q2：附带 UMID 自检字段（present/source/shim_active/token_age/vm_brand…）。
+    # 只增不删；与 vm_status 同名的键（is_vm / vm_type_code）保留 vm_status 的
+    # 口径（它来自本次 bridge 输出，更新），其余用缓存视图补齐。
+    try:
+        for key, value in umid_status(r).items():
+            st.setdefault(key, value)
+    except Exception:
+        pass
     _vm_cache[r] = (now, st)
     return st
 
@@ -3718,6 +3881,9 @@ class AccountPool(object):
         self._expiry_weights = {}
         # 启动时校验容器时区（业务时序已统一 UTC+8，告警只是提醒，不阻断启动）
         warn_timezone_skew()
+        # UMID 自检（Q2）：present/source/shim_active/token_age/vm_brand 一行，
+        # 只读路径与落盘缓存——不执行组件、不联网、不含任何 token 内容。
+        _log_umid_startup(self.log)
         _ACTIVE_POOL = self
 
     def load(self):

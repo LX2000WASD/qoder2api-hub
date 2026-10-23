@@ -129,6 +129,7 @@ Key 的生效优先级（高 → 低），启动日志只打印**来源**、不�
 | `accounts/` 不可写 | 设备身份无法落盘，每次重建容器都会换一台「设备」 |
 | `accounts/settings.json` 的权限不是 `600` | 文件里是 API Key 明文，同机其他用户可读。执行 `chmod 600 accounts/settings.json`（挂载目录被宿主机改过权限时最常见） |
 | 容器里启用了国际版账号（只在容器中检查） | 数据中心出口访问国际版网关容易被风控，表现为聊天一直排队。建议改用住宅出口，或改用国内版，见[风控处置手册](risk-control-playbook.md) |
+| `umid` 自检是 `present=no`，或 `token_age` 一直很小 | 镜像里没有原生组件 / 容器 home 不可写 → 每次调用都重新向 UMID 注册。签到与活动链路可能被上游过滤，见下文「容器里的 UMID」 |
 
 启动日志还有四行自检（**不含任何敏感值**，可直接贴进工单）：
 
@@ -161,6 +162,82 @@ identity   : device_id=uuidv4 | legacy=0 | umid=present(age=2h)
 | `QD_MACHINE_IDENTITY_CACHE_TTL=<秒>` | 定期轮换身份，默认 `0` 表示永不过期 |
 
 如果你不挂载 `accounts/`，又希望重启后身份不变，可以在 compose 里固定网卡 MAC（`mac_address:`，请自己生成一个，不要照抄示例），或者改用 `network_mode: host`。这两种做法都只能保证「重启不变」，重建容器还是会换身份。
+
+### 容器里的 UMID：HOME、hostname 与 shim 灰度（v1.8.0 起）
+
+官方 `runtime-info` 并不是「本地探测器」，而是阿里 UMID 的**联网注册客户端**：
+`machineToken` 由服务端签发（注册时连 `pum.m.alibaba.com`），注册缓存写在
+**passwd home** 的 `~/.config/.locale_cfg`（350 B JSON）。因此有两个推论：
+
+1. 断网 + 无缓存时组件**没有输出**（`sgsdk init callback reported error code 6`），网关会回退到
+   `accounts/machine_identity.json`，再不行才退派生身份；
+2. 容器里如果 home 不可写，每次调用都会**重新注册**（token 每次都变），身份只能靠
+   `accounts/machine_identity.json` 兜底。
+
+> 以上结论与判据见 [docs/plan/02-vm-identity.md](02-vm-identity.md)；`vmInfo`（`isVm` / `brand` /
+> `vmTypeCode`）是**本地打分、不上行**，实体机也会误报（KVM 模块、Windows VBS/HVCI），
+> 所以它不是封号信号，本仓库**不做任何 DMI / VM 伪装**。
+
+**镜像与编排（默认行为，无需配置）**
+
+- 镜像里 `adduser -h /app/home`（不是 `-H`）+ `ENV HOME=/app/home`：passwd home 与 `$HOME`
+  **指向同一处**。这一点必须一致 —— `_purge_identity_seed()` 用 `expanduser("~")` 清种子，
+  两者不一致时会清不到组件真正的缓存，「换身份」自愈会空转；
+- `docker-compose.yml` 挂 `./accounts/umid-home:/app/home`：注册缓存跨重建保留（放在 `accounts/`
+  子目录里复用已有持久卷与 `.gitignore`；`AccountPool.load()` 只扫顶层 `*.json`，子目录不会被当成账号）；
+- 首次启动前 `sudo chown -R 10001:10001 ./accounts ./usage`（非 root 运行）。
+
+**自检**：启动日志多一行（不含任何 token 内容，可直接贴工单），`/diag/vm` 返回同源字段：
+
+```text
+umid: present=yes source=native shim_active=0 token_age=2h vm_brand=KVM vm_type_code=13
+```
+
+| 字段 | 含义 |
+|---|---|
+| `present` | 组件（或 shim）是否可用；`no` = 镜像里没有提取到，功能降级 |
+| `source` | `native`（官方组件）/ `shim`（QD_UMID_SHIM）/ `none` |
+| `shim_active` | 本次是否走 shim（`0` = 正常路径） |
+| `token_age` | `accounts/machine_identity.json` 里该区域身份的缓存年龄 |
+| `vm_brand` / `vm_type_code` | 缓存里的本地 VM 判定（仅诊断） |
+
+- 启动自检**不执行组件**（只读路径与缓存），不会拖慢启动；要看实时判定用 `/diag/vm?force=1`
+- `hostname:`（compose 里默认注释）可选固定：官方桌面端的 `Cosy-MachineHostname` 取本机 hostname，
+  容器默认是容器 ID，每次重建都变。填一个**你自己的**名字，不要照抄示例（共用同一个值反而是共同指纹）
+
+**shim 灰度（默认关，仅用于实验）**
+
+`QD_UMID_SHIM=<可执行文件>` 让网关用你自己的程序替代官方组件，契约完全一致：
+
+```text
+argv : <exe> <0|3> [--account-stdin]      # 0=国内 / 3=国际
+stdin: {"account":"<uid>"}\n             # 仅 darwin/win32 且带 account 时
+stdout: 单行 JSON，至少 machineToken/machineType/machineCode
+exit : 0=成功；非 0 且无输出 -> 网关按「组件不可用」回退缓存/派生
+```
+
+示例（不内置任何 token，JSON 由你从环境变量或 0600 文件提供）：
+
+```yaml
+    environment:
+      - QD_UMID_SHIM=/opt/umid-shim/umid_shim_example.sh
+    volumes:
+      - ./scripts/umid_shim_example.sh:/opt/umid-shim/umid_shim_example.sh:ro
+```
+
+```bash
+QD_UMID_SHIM_JSON_FILE=/app/home/umid-shim.json   # 0600；不要写进 git / 镜像层
+```
+
+命中 shim 时 stderr 打一次 `[umid] shim_active=1`（启动那行也会显示 `shim_active=1`）。
+
+> ⚠️ **风险（务必读完再开）**：服务端是否拿 `machineToken` 反查 UMID **未经验证**。
+> 若反查，假 token 可能让活动列表整条消失 —— 比「不发机器头」（已验证仍能看到通用活动）更差。
+> 因此 shim 只用于**单账号灰度观测**，默认关闭、随时可回滚；不要用它伪造物理机/虚拟机
+> （`vmInfo` 不上行，伪造没有收益），也不要把 shim 当作生产方案。
+
+**回滚**：去掉 `QD_UMID_SHIM` 与对应挂载即回到官方组件；要同时换回身份就
+`QD_MACHINE_IDENTITY_RESET=1`（或删 `accounts/machine_identity.json`）。
 
 ## 出口代理
 

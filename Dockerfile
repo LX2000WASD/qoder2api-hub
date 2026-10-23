@@ -75,13 +75,22 @@ COPY tests/ ./tests/
 # （accounts/、usage/、settings.json）都不再是 root。umid 组件只需读+执行，
 # 保持 root 属主（最小权限）；alpine 的 /tmp 是 1777，python 临时文件无碍。
 # 注意：bind mount 的宿主机目录需先 chown（见 docker-compose.yml 注释）。
-RUN adduser -D -u 10001 -H qoder && \
-    mkdir -p /app/accounts /app/usage && \
-    chown -R qoder:qoder /app/accounts /app/usage
+#
+# /app/home（Q2，docs/plan/02-vm-identity.md §5.2）：UMID 组件按 /etc/passwd
+# 的 home 写注册缓存 ~/.config/.locale_cfg（350B，服务端签发的 token）。旧写法
+# adduser -H 不建 home，组件每次调用都要重新向 UMID 注册（token 每次变，只能
+# 靠 accounts/machine_identity.json 兜底）。这里把 passwd home 直接设成
+# /app/home：passwd home 与 ENV HOME 必须指向同一处，否则
+# qoder_accounts._purge_identity_seed()（expanduser("~")）清不到组件真正的
+# 缓存，「换身份」自愈会空转。持久化挂卷见 docker-compose.yml。
+RUN adduser -D -u 10001 -h /app/home qoder && \
+    mkdir -p /app/accounts /app/usage /app/home && \
+    chown -R qoder:qoder /app/accounts /app/usage /app/home
 USER 10001
+ENV HOME=/app/home
 
-# Volume persistence for credentials and usage logs
-VOLUME ["/app/accounts", "/app/usage"]
+# Volume persistence for credentials, usage logs and UMID home（Q2）
+VOLUME ["/app/accounts", "/app/usage", "/app/home"]
 
 EXPOSE 8790
 

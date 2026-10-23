@@ -51,11 +51,24 @@ services:
       # 或者启动时带 --panel-password <新密码>。个人本机用法可改回 0（= 上游行为）。
       - QD_REQUIRE_PANEL_PASSWORD=1
       - TZ=Asia/Shanghai
+      # UMID shim 灰度（Q2，默认关；docs/plan/02-vm-identity.md §4 方案②）
+      # 指向一个与 runtime-info 同契约的可执行文件（argv/stdin/stdout 一致）。
+      # ⚠️ 服务端是否拿 token 反查 UMID 未验证；只用于灰度观测，不要用来伪造
+      #   物理机（vmInfo 不上行，伪造无收益）。示例脚本见 scripts/umid_shim_example.sh：
+      # - QD_UMID_SHIM=/opt/umid-shim/umid_shim_example.sh
     volumes:
       # 持久化挂载账号凭证与用量流水
       # NAS / 长期部署建议改成绝对路径，避免源码目录被重装覆盖时连数据一起删掉
       - ./accounts:/app/accounts
       - ./usage:/app/usage
+      # UMID 组件的可写 home（Q2）：组件把注册缓存写在 passwd home 的
+      # ~/.config/.locale_cfg（350B）；镜像已把 passwd home 与 HOME 都设为
+      # /app/home（见 Dockerfile）。不挂卷时容器重建 = 重新注册（换设备）。
+      # 放在 accounts/ 子目录里，复用已有的持久卷与 .gitignore（不新增顶层目录；
+      # AccountPool.load() 只扫顶层 *.json，子目录不会被当成账号）。
+      - ./accounts/umid-home:/app/home
+      # 灰度 shim 挂载示例（与上面的 QD_UMID_SHIM 配套，默认注释）：
+      # - ./scripts/umid_shim_example.sh:/opt/umid-shim/umid_shim_example.sh:ro
     # 资源上限：网关常态占用远低于 1G/2 核，超限被 OOM 杀掉好过把宿主机拖垮。
     mem_limit: 1g
     cpus: "2"
@@ -65,7 +78,7 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-    # ⚠️ 权限：镜像内以非 root 运行（uid 10001，见 Dockerfile）。上面两个是 bind
+    # ⚠️ 权限：镜像内以非 root 运行（uid 10001，见 Dockerfile）。上面的 bind
     # 挂载，宿主机目录默认属于你的账号（uid 一般是 1000），首次启动前执行一次：
     #     sudo chown -R 10001:10001 ./accounts ./usage
     # 不想 chown 也可以在这里加 user: "1000:1000" 覆盖（放弃非 root 收益）。
