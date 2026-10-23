@@ -101,6 +101,84 @@ def key_model_message(entry, model):
             % (name, asked, allowed))
 
 
+# ------------------------------------------------------------ 模型名归一
+# 2026 加固：闸门与 /v1/models 过滤必须按「同一个模型」判定，而不是按客户端
+# 恰好写的那串字。官方 catalog 明确接受四种等价写法（上游 key / display_name /
+# 「key (Name)」展示 id / 小写人类别名，见 qoder_catalog.resolve_upstream_key），
+# 所以归一必须复用**同一个解析器** —— 否则「白名单配 qmodel_38max、客户端写
+# Qwen3.8-Max」会被误拒，而 open_upstream 又会把它当作 qmodel_38max 发出去
+# （判定与出站双源，是最难解释的一类 bug）。open_upstream 也走这个解析器。
+_MODEL_NAME_INDEX = {}       # realm -> {上游 key: (display_name, 展示 id)}
+
+
+def _model_name_index(realm):
+    """realm 的 key -> (display_name, 「key (Name)」) 索引（进程内缓存）。
+
+    双区同名 key 可能对应不同型号（mmodel：国内 MiniMax-M2.7 / 国际 M3），
+    所以没指定区域时不做跨区合并，而是按 "both" 分开缓存、按区域优先取。
+    """
+    slot = realm if realm in ("cn", "intl") else "both"
+    cached = _MODEL_NAME_INDEX.get(slot)
+    if cached is not None:
+        return cached
+    index = {}
+    for r in (("cn", "intl") if slot == "both" else (slot,)):
+        try:
+            models = qoder_catalog.models_for_realm(r)
+        except Exception:
+            models = []
+        for m in models:
+            mid = m.get("key")
+            if mid and mid not in index:
+                try:
+                    display = qoder_catalog.display_id(m)
+                except Exception:
+                    display = m.get("display_name") or mid
+                index[mid] = (m.get("display_name") or "", display)
+    _MODEL_NAME_INDEX[slot] = index
+    return index
+
+
+def canonical_model_key(model, realm=None):
+    """把客户端写的模型名归一为上游 catalog key（解析不出则原样返回）。
+
+    与 open_upstream 共用 qoder_catalog.resolve_upstream_key，保证「闸门判定的
+    模型」和「真正发出去的模型」永远是同一个。
+    """
+    raw = str(model or "").strip()
+    if not raw:
+        return ""
+    try:
+        return qoder_catalog.resolve_upstream_key(raw, realm=realm)
+    except Exception:
+        return raw
+
+
+def model_name_variants(model, realm=None):
+    """同一个模型的全部等价写法（小写）：原始名、上游 key、display_name、展示 id。
+
+    白名单/封禁的 pattern 可以写成其中任意一种；匹配时逐个试。
+    """
+    out = []
+
+    def add(value):
+        name = str(value or "").strip().lower()
+        if name and name not in out:
+            out.append(name)
+
+    add(model)
+    canonical = canonical_model_key(model, realm)
+    add(canonical)
+    try:
+        meta = _model_name_index(realm).get(canonical)
+        if meta:
+            add(meta[0])        # 官方 display_name（如 Qwen3.8-Max）
+            add(meta[1])        # 展示 id「key (Name)」
+    except Exception:
+        pass
+    return out
+
+
 # 198.18.0.0/15 (RFC 2544 benchmarking) 与 fdfe:dcba:9876::/48 被 Clash/mihomo
 # 等本地代理用作 fake-IP DNS 段：开启透明代理的机器上所有公网域名都会解析到
 # 这些网段。命中它说明 DNS 已被本机代理接管、真实 IP 不可见，此时跳过解析级
@@ -2533,6 +2611,11 @@ def runtime_settings_view():
             else "*" * len(raw),
             "source": entry.get("source") or "panel",
             "created_at": entry.get("created_at") or "",
+            # 2026 加固：面板要能回显这两项，否则「整表保存」会把它们清空
+            # （models 是白名单、note 是备注；两者都由 _clean_key_entry 保留，
+            #  但视图不返回 → 前端拿不到 → 下次提交就是空值）。
+            "models": list(entry.get("models") or []),
+            "note": entry.get("note") or "",
         })
     return {
         "panel_password_is_default":
@@ -2546,6 +2629,9 @@ def runtime_settings_view():
         # global/intl/cn，未设时全为 0/None），面板读到即可安全回显、再保存不会
         # 把已有阈值覆盖成默认值。
         "limits": qoder_settings.limits_data(ACCOUNTS_DIR),
+        # 模型闸门的全局封禁列表（面板「模型闸门」section 回显/编辑用）。
+        # 与保存分支同源：set_banned_models 返回清洗后的列表。
+        "banned_models": qoder_settings.banned_models(ACCOUNTS_DIR),
         # 本地 web 工具开关（默认关）：这是唯一由模型驱动出网的能力
         "web_tools": web_tools_enabled(),
         "web_tools_rounds": WEB_TOOLS_MAX_ROUNDS,
@@ -2954,6 +3040,45 @@ def fetch_models_merged():
                 continue
             seen.add(mid)
             out.append((mid, meta, r))
+    return out
+
+
+def model_entries_visible(entries, key_entry=None, include_all=False):
+    """/v1/models 的可见性过滤（单一判据，路由与测试共用）。
+
+    过滤顺序（与 §5 方案一致，但本轮**不改错误码**）：
+      1. include_all（?all=1，面板模型库用）→ 全部放行；
+      2. 官方 enable=false（当前账号/套餐未开通）→ 不列出；
+      3. 全局 banned_models → 不列出；
+      4. 该 Key 的 models 白名单 → 只列允许的（按归一后的全部写法匹配）。
+    入参 entries 是 fetch_models（(mid, meta)）或 fetch_models_merged
+    （(mid, meta, realm)）的结果；返回同样的元组，保持顺序。
+    任何读配置异常一律放行（fail-open：列模型不是鉴权，不能因配置损坏而空表）。
+    """
+    if include_all:
+        return list(entries or [])
+    try:
+        banned = qoder_settings.banned_models(ACCOUNTS_DIR)
+    except Exception:
+        banned = []
+    out = []
+    for row in entries or []:
+        try:
+            mid = row[0]
+            meta = row[1] if len(row) > 1 else {}
+            realm = row[2] if len(row) > 2 else None
+        except Exception:
+            continue
+        if isinstance(meta, dict) and meta.get("enable") is False:
+            continue
+        names = model_name_variants(mid, realm)
+        if any(fnmatch.fnmatchcase(name, pattern)
+               for pattern in banned for name in names):
+            continue
+        if key_entry and not qoder_settings.key_allows_model(
+                key_entry, mid, aliases=names):
+            continue
+        out.append(row)
     return out
 
 
@@ -9017,6 +9142,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _key_ok(self):
         """True when the request carries a right key (or no key is needed)."""
+        # key_entry 是**连接级**残留状态（keep-alive 下同一 Handler 实例处理多条
+        # 请求）：面板会话分支早返回时若不清，上一条请求的 Key 归属与 /v1/models
+        # 的模型过滤会串到下一条请求上。每个请求先归零。
+        self.key_entry = None
         # 面板会话同时解锁管理 API，浏览器无需在 localStorage 存 API key。
         if self._panel_ok():
             return True
@@ -9053,22 +9182,29 @@ class Handler(BaseHTTPRequestHandler):
                 "请改用对应出口的 Key，或把该 Key 的出口改为「跟随面板切换」。"
                 % (model, served, name, used))
 
-    def _banned_model_error(self, model):
-        """P1-4 全局封禁：命中即返回文案（不碰上游、不扣任何点数）。"""
-        if not is_model_banned(model):
+    def _banned_model_error(self, model, realm=None):
+        """P1-4 全局封禁：命中即返回文案（不碰上游、不扣任何点数）。
+
+        2026 加固：按**归一后的全部等价写法**判（上游 key / display_name /
+        「key (Name)」/ 原始名）。否则封禁表里写官方模型名、客户端写 key 就能绕过。
+        """
+        variants = model_name_variants(model, realm)
+        if not any(is_model_banned(name) for name in variants):
             return ""
         return banned_model_message(model)
 
-    def _key_model_error(self, model):
+    def _key_model_error(self, model, realm=None):
         """P1-4 每 Key 模型白名单：在请求到达上游之前拒绝。
 
         未设 models 的 Key 不受限（空列表 = 不限制），因此这是 no-op，
-        除非管理员显式配置了限制。
+        除非管理员显式配置了限制。判定同样按归一后的全部写法（见
+        model_name_variants），所以白名单配 key 或配官方模型名都生效。
         """
         entry = getattr(self, "key_entry", None)
         if not entry:
             return ""
-        if qoder_settings.key_allows_model(entry, model):
+        if qoder_settings.key_allows_model(entry, model,
+                                           aliases=model_name_variants(model, realm)):
             return ""
         return key_model_message(entry, model)
 
@@ -9078,10 +9214,12 @@ class Handler(BaseHTTPRequestHandler):
         顺序：跨区错配[既有] -> 全局封禁[P1-4] -> Key 白名单[P1-4]。
         三处请求入口（chat / responses / anthropic messages）**共用本方法**——
         新增入口必须一并挂上，否则会出现「chat 被拦、别的协议绕过」的缺口。
+        2026 加固：封禁/白名单前统一做模型名归一（model_name_variants），
+        与 open_upstream 出站用的是同一个 catalog 解析器。
         """
         return (self._cross_realm_error(model, realm)
-                or self._banned_model_error(model)
-                or self._key_model_error(model))
+                or self._banned_model_error(model, realm)
+                or self._key_model_error(model, realm))
 
     def _request_realm(self, explicit=None):
         """Pick the upstream exit for this request.
@@ -9342,19 +9480,28 @@ class Handler(BaseHTTPRequestHandler):
                 entries = fetch_models(realm=req_realm)
             except Exception as exc:
                 return self._error(502, str(exc))
+            # 2026 加固：默认只列「本网关真的能用」的模型（官方 enable=false /
+            # 全局封禁 / 该 Key 白名单之外的一律不列）。面板模型库要看全量
+            # （含未开通套餐项及其官方原因），显式带 ?all=1 绕过过滤。
+            include_all = str((query.get("all") or [""])[0]).lower() in (
+                "1", "true", "yes", "on")
+            key_entry = getattr(self, "key_entry", None)
             merge = str((query.get("merge_realms") or [""])[0]).lower() in (
                 "1", "true", "yes", "on")
             if merge:
                 # #26 步4：两区并集（**opt-in**）。默认必须保持单区视图 ——
                 # 否则 _verify_models 与既有客户端会看到「多出来的」别区模型。
                 merged = fetch_models_merged()
+                visible = model_entries_visible(merged, key_entry, include_all)
                 data = [model_entry(mid, meta, realm=r)
-                        for mid, meta, r in merged]
+                        for mid, meta, r in visible]
                 return self._json(200, {"object": "list", "data": data,
                                         "realm": "all", "merged": True,
-                                        "realms": ["cn", "intl"]})
+                                        "realms": ["cn", "intl"],
+                                        "filtered": not include_all})
+            visible = model_entries_visible(entries, key_entry, include_all)
             data = [model_entry(mid, meta, realm=req_realm)
-                    for mid, meta in entries]
+                    for mid, meta in visible]
             try:
                 catalog_source = qoder_catalog.snapshot_source(req_realm)
             except Exception as exc:   # 只读探针：失败也不能拖垮模型列表
@@ -9362,7 +9509,8 @@ class Handler(BaseHTTPRequestHandler):
                 log("catalog source probe failed: %s" % exc, level="WARN")
             return self._json(200, {"object": "list", "data": data,
                                     "realm": req_realm or CURRENT_REALM,
-                                    "catalog_source": catalog_source})
+                                    "catalog_source": catalog_source,
+                                    "filtered": not include_all})
         if path in ("/usage", "/v1/usage"):
             if not self._authorized():
                 return
@@ -9813,6 +9961,17 @@ class Handler(BaseHTTPRequestHandler):
                     or (existing.get(entry_id, {}).get("created_at")
                         if entry_id in existing else None) \
                     or time.strftime("%Y/%m/%d %H:%M")
+                previous = existing.get(entry_id) or {}
+                # 面板是**整表保存**：字段缺失或显式 null 都表示「保留旧值」，
+                # 只有显式 [] / "" 才是清空。旧实现直接 item.get("models")
+                # （前端不发该键 → 恒为 None → _clean_model_patterns(None) → []），
+                # 于是「改个备注/启停个 Key」就把白名单静默抹掉（数据丢失）。
+                models_value = item.get("models")
+                if models_value is None:
+                    models_value = previous.get("models")
+                note_value = item.get("note")
+                if note_value is None:
+                    note_value = previous.get("note") or ""
                 cleaned.append({
                     "id": entry_id,
                     "name": str(item.get("name") or "").strip(),
@@ -9820,9 +9979,11 @@ class Handler(BaseHTTPRequestHandler):
                     "realm": realm,
                     "enabled": item.get("enabled", True) is not False,
                     "created_at": created_at,
-                    # P1-4：每 Key 模型白名单（原样透传；规范化统一在
+                    # P1-4：每 Key 模型白名单（规范化统一在
                     # qoder_settings._clean_key_entry 一处完成）。
-                    "models": item.get("models"),
+                    "models": models_value,
+                    # issue #69：Key 备注（同型保留语义，避免整表保存清空）。
+                    "note": note_value,
                 })
             qoder_settings.set_api_keys(ACCOUNTS_DIR, cleaned)
             reply["api_keys_saved"] = len(cleaned)

@@ -1226,6 +1226,23 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       <div id="keyList"></div>
     </section>
 
+    <section id="sectionModelGates">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:10px">
+        <div>
+          <h2 style="margin:0">模型闸门 <em id="setBannedModelsState"></em></h2>
+          <div style="font-size:12px;color:var(--dim);margin-top:4px;line-height:1.6">
+            全局封禁列表（逗号 / 分号 / 换行分隔，支持 <code>qwen*</code> 通配、不分大小写）。
+            命中的模型在本地直接拒绝（400，不发上游、不扣点数），也不出现在 <code>/v1/models</code> 里。
+            每个 API Key 还能再设一份白名单（上面 Key 卡片的「模型白名单」），两者同时生效时取交集。
+          </div>
+        </div>
+        <button id="btnSaveBannedModels" onclick="saveBannedModels(this)">保存封禁列表</button>
+      </div>
+      <input type="text" id="setBannedModels" placeholder="如: qmodel_latest, glm-5.3"
+             style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;font:inherit;color:var(--fg)">
+      <div style="font-size:11px;color:var(--dim);margin-top:6px">写官方模型名或上游 key 都算同一个模型；留空 = 不封禁任何模型。</div>
+    </section>
+
 
     <section id="sectionWebTools">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:10px">
@@ -1900,7 +1917,9 @@ async function loadModels(){
     renderAvailableModels();
   }
   try{
-    const r = await getJSON('/v1/models?realm=' + encodeURIComponent(realm));
+    // all=1：模型库要展示官方全量（含未开通套餐项及其官方原因），
+    // 不带它会按「官方 enable / 全局封禁 / Key 白名单」过滤。
+    const r = await getJSON('/v1/models?all=1&realm=' + encodeURIComponent(realm));
     // 2) 后台刷新；仅当用户仍停留在同一区域时覆盖界面
     MODELS_CACHE[realm] = r.data || [];
     if((window.VIEW_REALM || "intl") === realm){
@@ -4181,7 +4200,7 @@ async function loadSettings(showToast){
     // Rebuild the editable rows, keeping stored values so an untouched field
     // is not accidentally blanked.
     API_KEY_ROWS = (data.api_keys || []).map(k => ({
-    note: k.note || '',
+      note: k.note || '',
       id: k.id || '',
       name: k.name || '',
       key: '',
@@ -4192,6 +4211,9 @@ async function loadSettings(showToast){
       realm: k.realm || '',
       enabled: k.enabled !== false,
       created_at: k.created_at || '',
+      // 每 Key 模型白名单：必须回显并原样回传，否则整表保存会把它清空
+      // （后端 _clean_key_entry 是白名单式重建；旧版这里没有该字段）。
+      models: Array.isArray(k.models) ? k.models : [],
       _editing: false,
     }));
     window.API_KEY_ROWS = API_KEY_ROWS;
@@ -4204,6 +4226,15 @@ async function loadSettings(showToast){
     set('setFile', data.settings_file);
     set('setSettingsFile', data.settings_file);
     renderLimits(data.limits || null);   // 后端 GET /settings 带回 limits 时才允许保存（见 saveLimits 的护栏）
+    // 模型闸门（全局封禁）：回显后端清洗后的 pattern 列表
+    const bannedInput = document.getElementById('setBannedModels');
+    if(bannedInput) bannedInput.value = (data.banned_models || []).join(', ');
+    const bannedState = document.getElementById('setBannedModelsState');
+    if(bannedState){
+      const n = (data.banned_models || []).length;
+      bannedState.textContent = n ? ('(' + n + ' 条封禁规则)') : '(未封禁)';
+      bannedState.style.color = n ? 'var(--warn)' : 'var(--dim)';
+    }
     if(showToast) toast('设置已刷新', 'ok');
   } catch(e) {
     if(showToast) toast('读取设置失败: ' + e.message, 'bad');
@@ -4302,6 +4333,12 @@ function renderKeyRows(){
         +       'style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:7px 10px;font:inherit;color:var(--fg)">'
         +   '</div>'
         +   '<div style="grid-column:1 / -1">'
+        +     '<div style="font-size:12px;color:var(--dim);margin-bottom:4px;font-weight:500">模型白名单（可选，逗号分隔，支持 qwen* 通配；留空 = 不限制）</div>'
+        +     '<input type="text" id="editKeyModels_' + i + '" value="' + esc(keyModelsText(row)) + '" placeholder="如: qwen3.8-max, glm-5.3, deepseek-*" '
+        +       'style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:7px 10px;font:inherit;color:var(--fg)">'
+        +     '<div style="font-size:11px;color:var(--dim);margin-top:4px">填官方模型名或上游 key 都算同一个模型（Qwen3.8-Max / qmodel_38max / qwen3.8-max 等价）；只有列出的模型能被该 Key 调用，/v1/models 也只会返回这些。</div>'
+        +   '</div>'
+        +   '<div style="grid-column:1 / -1">'
         +     '<div style="font-size:12px;color:var(--dim);margin-bottom:4px;font-weight:500">API Key 内容 ' + (row.masked ? '<span style="color:var(--dim-light)">(已保存: ' + esc(row.masked) + '，留空表示不改)</span>' : '') + '</div>'
         +     '<div style="display:flex;gap:8px">'
         +       '<input type="text" id="editKeyValue_' + i + '" value="' + esc(row.key || '') + '" placeholder="' + (row.masked ? '留空表示保持原 Key 不变' : '输入自定义密钥，或点击右侧生成') + '" '
@@ -4327,6 +4364,12 @@ function renderKeyRows(){
       ? '<span class="realm-badge-cn" style="font-size:11px">固定国内版出口</span>'
       : '<span class="badge s" style="font-size:11px">跟随面板切换</span>';
 
+    // 模型白名单在卡片上直接可见：管理员一眼能看出「这个 Key 只开放了哪几个模型」。
+    const modelsList = row.models || [];
+    const modelsText = modelsList.length ? modelsList.join(', ') : '';
+    const modelsBadge = modelsList.length
+      ? '<span class="badge warn" style="font-size:11px" title="模型白名单：' + esc(modelsText) + '">模型限制 ' + modelsList.length + ' 条</span>'
+      : '<span class="badge s" style="font-size:11px;color:var(--dim)">模型不限</span>';
     const displayKey = row.masked || (row.key ? (row.key.slice(0, 4) + '******' + row.key.slice(-4)) : '未设置');
     const createdStr = row.created_at ? ('创建时间 ' + esc(row.created_at)) : '';
 
@@ -4337,10 +4380,12 @@ function renderKeyRows(){
       +       '<span style="font-size:15px;font-weight:700;color:var(--fg)">' + esc(row.name || '未命名') + '</span>'
       +       statusBadge
       +       realmBadge
+      +       modelsBadge
       +     '</div>'
       +     '<div style="font-size:12px;color:var(--dim);display:flex;align-items:center;gap:16px;flex-wrap:wrap">'
       +       '<span>Key: <span class="mono" style="color:var(--fg);font-weight:500">' + esc(displayKey) + '</span></span>'
       +       (createdStr ? ('<span>' + createdStr + '</span>') : '')
+      +       (modelsText ? ('<span>模型: <span class="mono" style="color:var(--fg)">' + esc(modelsText.length > 80 ? modelsText.slice(0, 80) + '…' : modelsText) + '</span></span>') : '')
       +     '</div>'
       +     (row.note ? ('<div style="font-size:12px;color:var(--accent);margin-top:6px" title="备注">' + esc(row.note) + '</div>') : '')
       +   '</div>'
@@ -4353,6 +4398,21 @@ function renderKeyRows(){
       + '</div>'
       + '</div>';
   }).join('');
+}
+
+// 模型白名单：UI 用逗号分隔的文本，后端存 pattern 列表（清洗在 qoder_settings）。
+function keyModelsText(row){
+  const list = (row && row.models) || [];
+  return list.join(', ');
+}
+
+function splitModelPatterns(text){
+  const out = [];
+  String(text || '').split(/[,;\n]/).forEach(part => {
+    const name = part.trim().toLowerCase();
+    if(name && out.indexOf(name) < 0) out.push(name);
+  });
+  return out;
 }
 
 function openEditKey(index){
@@ -4385,11 +4445,15 @@ async function saveSingleKey(index, btn){
   const realmSelect = document.getElementById('editKeyRealm_' + index);
   const keyInput = document.getElementById('editKeyValue_' + index);
   const noteInput = document.getElementById('editKeyNote_' + index);
+  const modelsInput = document.getElementById('editKeyModels_' + index);
 
   const name = nameInput ? nameInput.value.trim() : (row.name || '');
   const realm = realmSelect ? realmSelect.value : (row.realm || '');
   const keyVal = keyInput ? keyInput.value.trim() : (row.key || '');
   const note = noteInput ? noteInput.value.trim() : (row.note || '');
+  // 留空 = 不限制（显式空数组，允许清空）；有值则按逗号/分号/换行切分。
+  const models = modelsInput ? splitModelPatterns(modelsInput.value)
+                             : (row.models || []);
 
   if(!keyVal && !row.masked){
     toast('API Key 不能为空', 'warn');
@@ -4399,6 +4463,7 @@ async function saveSingleKey(index, btn){
   row.name = name || '未命名';
   row.realm = realm;
   row.note = note;
+  row.models = models;
   if(keyVal) row.key = keyVal;
   row._editing = false;
 
@@ -4508,6 +4573,9 @@ async function saveApiKeys(btn){
     // Blank means "keep the stored key", which the server honours per row.
     key: (row.key || '').trim(),
     note: (row.note || '').trim(),
+    // 每 Key 模型白名单：**必须回传**。整表保存时后端按「缺失 = 保留旧值」
+    // 处理，但只有显式 [] 才清空 —— 漏发这个字段曾导致保存一次就丢白名单。
+    models: row.models || [],
   }));
   const newRow = API_KEY_ROWS.find(row => !row.masked && !(row.key || '').trim());
   if(newRow){
@@ -4524,6 +4592,30 @@ async function saveApiKeys(btn){
   } catch(e) {
     toast('保存失败: ' + e.message, 'bad');
   } finally {
+    if(btn) btn.disabled = false;
+  }
+}
+
+// 模型闸门：全局封禁列表（banned_models）。后端 set_banned_models 会把输入
+// 清洗成小写 pattern 列表并回传，这里用回传值回显，避免"看起来保存了但没生效"。
+async function saveBannedModels(btn){
+  const el = document.getElementById('setBannedModels');
+  const text = el ? el.value : '';
+  if(btn) btn.disabled = true;
+  try{
+    const r = await postJSON('/settings/save', {banned_models: text});
+    const list = r.banned_models || [];
+    if(el) el.value = list.join(', ');
+    const st = document.getElementById('setBannedModelsState');
+    if(st){
+      st.textContent = list.length ? ('(' + list.length + ' 条封禁规则)') : '(未封禁)';
+      st.style.color = list.length ? 'var(--warn)' : 'var(--dim)';
+    }
+    toast(list.length ? ('已保存 ' + list.length + ' 条封禁规则') : '已清空封禁列表', 'ok');
+    loadModels();     // 模型库/下拉立即按新配置刷新
+  }catch(e){
+    toast('保存失败: ' + e.message, 'bad');
+  }finally{
     if(btn) btn.disabled = false;
   }
 }
