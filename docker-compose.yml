@@ -25,6 +25,8 @@ services:
       - HOST=0.0.0.0
       - PORT=8790
       # - API_KEY=your_api_key_here
+      # 本 fork 默认禁用「一键更新」（REPO 指向 fork；上游 tarball 会覆盖本地补丁）
+      - QD_UPDATE_DISABLE=1
       # ↑ 留空：容器以 --lan 启动，首次自动生成随机 Key 写入 ./accounts/settings.json
       #   并打印在日志（docker compose logs qoder-proxy | grep -i "api key"）
       - TZ=Asia/Shanghai
@@ -33,6 +35,19 @@ services:
       # NAS / 长期部署建议改成绝对路径，避免源码目录被重装覆盖时连数据一起删掉
       - ./accounts:/app/accounts
       - ./usage:/app/usage
+    # 资源上限：网关常态占用远低于 1G/2 核，超限被 OOM 杀掉好过把宿主机拖垮。
+    mem_limit: 1g
+    cpus: "2"
+    # 日志体积防线：json-file 单文件 10MB、保留 3 个滚动文件。
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # ⚠️ 权限：镜像内以非 root 运行（uid 10001，见 Dockerfile）。上面两个是 bind
+    # 挂载，宿主机目录默认属于你的账号（uid 一般是 1000），首次启动前执行一次：
+    #     sudo chown -R 10001:10001 ./accounts ./usage
+    # 不想 chown 也可以在这里加 user: "1000:1000" 覆盖（放弃非 root 收益）。
     healthcheck:
       # 跟随 PORT 环境变量（与镜像内 HEALTHCHECK 同语义），改容器端口不用同步改这里
       test: ["CMD", "python", "-c", "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:%s/ping' % os.environ.get('PORT','8790'),timeout=3)"]

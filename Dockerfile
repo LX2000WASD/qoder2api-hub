@@ -21,11 +21,14 @@ FROM python:3.11-alpine
 # Set environment
 # 注：API_KEY 默认为空，只作为 compose / docker run -e 的覆盖入口，不承载任何密钥。
 # （docker build 的 SecretsUsedInArgOrEnv lint 提示来自变量名，而非真实密钥内容。）
+# 本 fork 默认禁用「一键更新」：qoder_updater 的 REPO 指向本 fork，但上游
+# release 的 tarball 会覆盖本地补丁；容器内更不该自我替换代码。
 ENV PYTHONUNBUFFERED=1 \
     HOST=0.0.0.0 \
     PORT=8790 \
     API_KEY= \
-    TZ=Asia/Shanghai
+    TZ=Asia/Shanghai \
+    QD_UPDATE_DISABLE=1
 
 WORKDIR /app
 
@@ -60,8 +63,19 @@ COPY --from=umid-builder /build/umid /app/umid
 COPY _test_qoder.py _diag_gateway.py _diag_campaign.py _verify_models.py \
      _refresh_catalog.py _install_umid.py ./
 
-# Create data directories
-RUN mkdir -p /app/accounts /app/usage
+# tests/ 编排（约 200KB，纯标准库）：容器内可跑完整套件自检——
+#   docker run --rm qoder-proxy:<tag> python tests/run_all.py
+# .js 套件需要 node（镜像内没有，自动 [SKIP]）。
+COPY tests/ ./tests/
+
+# 非 root 运行：镜像以 uid 10001 的 qoder 用户启动——PID1 与所有写盘
+# （accounts/、usage/、settings.json）都不再是 root。umid 组件只需读+执行，
+# 保持 root 属主（最小权限）；alpine 的 /tmp 是 1777，python 临时文件无碍。
+# 注意：bind mount 的宿主机目录需先 chown（见 docker-compose.yml 注释）。
+RUN adduser -D -u 10001 -H qoder && \
+    mkdir -p /app/accounts /app/usage && \
+    chown -R qoder:qoder /app/accounts /app/usage
+USER 10001
 
 # Volume persistence for credentials and usage logs
 VOLUME ["/app/accounts", "/app/usage"]

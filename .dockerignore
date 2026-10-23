@@ -20,3 +20,10 @@ usage/
 .mimosa/
 _shots/
 umid/
+
+# CI / 文档不进镜像（Dockerfile 不 COPY 它们，顺便省构建上下文）
+.github/
+docs/
+
+# 套件的 __pycache__（根级 __pycache__ 上面已排除；带层级的子目录要单独写）
+tests/__pycache__/

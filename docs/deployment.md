@@ -182,3 +182,50 @@ Linux / macOS 先 `./stop-qoder-proxy.sh` 再 `./start-qoder-proxy.sh`（常驻/
 | `QD_UPDATE_ALLOW_CONTAINER` | 关 | 容器里默认拒绝自更新（镜像重建会覆盖），改为在宿主机 `docker compose pull` |
 
 > 容器部署请用 `docker compose pull`：镜像里的代码由镜像决定，容器内自更新会被下次重建覆盖。
+
+---
+
+## 本 fork 的运行时强化（v1.8.0 起）
+
+以下能力来自本 fork 在 v1.7.0 基线之上的重放（上游 v1.7.0 没有这些实现）；
+升级/替换镜像时请对照本节的验收项。
+
+### 进程生命周期与容量
+
+| 能力 | 行为 | 开关 / 观测 |
+|---|---|---|
+| SIGTERM 优雅退出 | 收到 `SIGTERM`（`docker stop` / systemd 默认信号）先停 listener，再唤醒空闲 keep-alive 连接（`shutdown(SHUT_RD)`），把剩余优雅期留给在途请求 | `QD_SHUTDOWN_GRACE`（秒，默认 10）；日志出现 `SIGTERM received: stopping listener, draining in-flight requests` |
+| 连接上限 | 活跃连接超过上限的新连接**直接 503**（不排队等线程），客户端按常规退避重试 | `QD_MAX_CONNECTIONS`（默认 256）；`/metrics` 的 `qoder_active_connections` |
+| SSE 有界队列（背压） | 读线程→主线程队列容量固定：慢客户端把背压传导到上游，而不是让上游数据灌满网关内存 | `QD_SSE_QUEUE_SIZE`（默认 16）、`QD_SSE_HEARTBEAT`、`QD_SSE_IDLE_LIMIT`（默认 900） |
+
+### 多实例互斥（跨进程）
+
+- 调度器用 `accounts/scheduler/.leader.lock`（`fcntl.flock`）选主：**同一时刻只有一个实例**执行签到 / 额度刷新 / 写 `state.json`；抢不到锁的实例只跳过本轮，不重复领取。
+- `state.json` 落盘改为**防抖批量**（2s 窗口 + 兜底定时器）；`mark-before-act` 的关键写入（启动补签闸门、开关变更、`stop()`）走 `force=True` 立即落盘。
+- 查看谁在当 leader：`/scheduler/status` 返回的 `is_leader`。
+
+### 用量流水按天轮转
+
+- 写入：`usage/usage-YYYY-MM-DD.jsonl`（**UTC+8 计日**，与签到业务日一致）；旧的 `usage/usage.jsonl` 仅作迁移期兼容读取。
+- 读取：看板/统计/`/usage/*` 一律跨文件读（旧文件 + 全部日文件），`fold_daily_usage` 折叠「当天 + 前 2 天」。
+- 汇总文件 `usage-summary.json` 改为**批量重写**：`QD_USAGE_FLUSH_ROWS`（默认 50 行）/ `QD_USAGE_FLUSH_SECS`（默认 300 秒）+ 退出强刷 + 后台 `qd-usage-flusher` 线程。
+
+### 观测与安全
+
+- **`GET /metrics`**：Prometheus 文本格式（账号池 total/ready/cooling、requests/errors/tokens、活跃线程/连接）。与 `/health` 同级**免鉴权**，要加认证请在反向代理层挡。
+- **`QD_LOG_JSON=1`**：日志改为 stdout 单行 JSON（`ts/level/tag/msg/id`），供采集器解析；默认仍是人类可读格式写 stderr。
+- **`/readyz` 是就绪探针**：池中零就绪账号时返回 503（供 docker/k8s 摘流）；`/ping`、`/livez`、`/healthz` 仍是 liveness，恒返回 `pong`。
+- **`accounts/settings.json` 以 0600 落盘**（内含 API key 明文），并带 (mtime, size) 读缓存与写后失效。
+
+### 镜像与编排
+
+- 镜像以 **uid 10001（非 root）** 运行，PID1 与所有写盘都不是 root。
+- `docker-compose.yml` 增加 `mem_limit: 1g`、`cpus: "2"` 与 json-file 日志滚动（10MB × 3）；bind mount 的宿主机目录需先 `sudo chown -R 10001:10001 ./accounts ./usage`。
+- 镜像内置 `tests/`：`docker run --rm qoder-proxy:<tag> python tests/run_all.py` 可在容器内跑全套件（`.js` 套件无 node 时自动 `[SKIP]`）。
+
+### 一键更新默认关闭
+
+本 fork 把 `qoder_updater.REPO` 指向 `LX2000WASD/qoder2api-hub`，并在镜像/编排里默认
+`QD_UPDATE_DISABLE=1`：更新只会拉**本 fork** 的 release，且默认不执行——上游 release 的
+tarball 会把本节的本地补丁全部覆盖掉。需要更新时请显式改回并用面板确认来源。
+

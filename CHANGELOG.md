@@ -9,6 +9,45 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
+## v1.8.0（本 fork）
+
+**基线切换到上游 v1.7.0**（89 个提交），本 fork 的运行时强化以 6 个补丁重新落盘。
+不是 merge：先在 `v1.7.0` 纯净基线上重放，再 `git merge -s ours` 记录分叉历史。
+
+**重放批次**（每批单独 commit，各自跑全量门禁）：
+
+| 批次 | 内容 | 来源 |
+|---|---|---|
+| Batch-1 | SIGTERM 优雅退出 + 连接排空（`QoderHTTPServer` / `_on_sigterm` / `QD_SHUTDOWN_GRACE`） | f14031a |
+| Batch-2 | 连接上限 `QD_MAX_CONNECTIONS` + 过载 503 + SSE 有界队列 `QD_SSE_QUEUE_SIZE` / `_SSE_IDLE_LIMIT` | f14031a |
+| Batch-2.5 | `/metrics` Prometheus 指标 + `QD_LOG_JSON` 结构化日志 + `settings.json` 0600 落盘与读缓存 + `/readyz` 就绪语义（零就绪账号 503） | f14031a |
+| Batch-3 | usage 按天轮转（`usage-YYYY-MM-DD.jsonl`，UTC+8）+ 跨文件读取 + 汇总批量刷盘 | abb38c8 / f14031a |
+| Batch-4 | 跨进程 `flock` + 调度 leader 锁（`.leader.lock`）+ `state.json` 防抖写盘 | f14031a |
+| Batch-5 | 非 root 镜像（uid 10001）+ 镜像内 `tests/` + CI 去重 + 一键更新指向 fork 并禁用 + 文档/CHANGELOG | f14031a |
+
+**保留的本地独有资产**（上游 v1.7.0 没有）：SIGTERM 排空、连接上限、SSE 背压、跨进程
+flock/leader 锁、usage 按天轮转、非 root 镜像、`/metrics`、`QD_LOG_JSON`、settings 0600、
+`/readyz` 摘流、镜像冒烟门禁（uid / 模块存在性 / 导入 / `/ping`）。
+
+**破坏性处理（升级必读）**：
+
+- **设备码切到 UUIDv4**（上游 #61/#75 形态）。升级后首次请求起，上游看到的是新设备码；
+  想保持旧形态设 `QD_DEVICE_ID_LEGACY=1`（长期建议切新，旧形态已是可识别指纹）。
+- **容器默认带 `--lan`**（上游 v1.7.0 的 CMD）：`API_KEY` 为空时首启会**生成并持久化**
+  随机 Key（`accounts/settings.json` → `launcher_key`，日志 `grep -i "api key"` 可查）。
+  已有面板 Key 的部署不受影响；无 Key 的旧部署会开始要求鉴权。
+- **一键更新默认禁用**：`qoder_updater.REPO` 改为 `LX2000WASD/qoder2api-hub`，镜像/编排
+  里默认 `QD_UPDATE_DISABLE=1`——上游 tarball 会覆盖上面全部本地补丁。
+- **删除**误提交的 `qoder-proxy.pid`，`.gitignore` 补 `*.pid`。
+- **`/readyz` 语义变化**：零就绪账号时 503（上游 v1.7.0 与 liveness 合并恒 200）。
+  docker/k8s 的就绪探针现在会真正摘流；liveness 仍用 `/ping`。
+
+**测试**：完整套件 **71 suites / 1951 checks / 0 failed**（上游 70 套件 + 本地
+`tests/_test_leak_guard.py`）。其中两个上游套件的**取文件方式**做了最小适配
+（`_test_error_row_fields` / `_test_credits_mapping`：轮转后写入落在日文件，
+改为经 `_usage_log_files()` 找写入方真正追加的文件，断言内容不变）；
+`_test_leak_guard` 的 B2 期望值跟随上游「跨帧回吐前缀 .rstrip()」的既定行为。
+
 ## v1.7.0
 
 **✨ 企业 / 团队账号（#90）**

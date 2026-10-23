@@ -24,7 +24,9 @@ import threading
 import time
 import urllib.request
 
-REPO = "shuishuipingan/qoder2api-hub"
+# 本 fork 的仓库地址：一键更新只应拉**本 fork** 的 release。指向上游会让
+# 更新把本地补丁（运行时强化 / usage 轮转 / 非 root 镜像）全部覆盖掉。
+REPO = "LX2000WASD/qoder2api-hub"
 TARBALL_URL = "https://github.com/%s/archive/refs/tags/%s.tar.gz" % (REPO, "%s")
 
 PROTECTED_TOP = {

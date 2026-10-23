@@ -27,3 +27,7 @@ Thumbs.db
 python/
 .tmp_*
 _acc/
+
+# 运行时产物（曾误提交过一次）
+*.pid
+qoder-proxy.pid
