@@ -1308,6 +1308,49 @@ def today_utc8():
     return now_utc8().strftime("%Y-%m-%d")
 
 
+# 时区偏移告警只提醒一次（进程级）；force=True 可重放（测试/诊断用）
+_TZ_SKEW_WARNED = False
+_UTC8_OFFSET = datetime.timedelta(hours=8)
+
+
+def _local_utc_offset():
+    """本机时区相对 UTC 的偏移（取不到时返回 None）。
+
+    单独抽成函数是为了可测：套件 monkeypatch 它就能覆盖「UTC / UTC+8 / 其它」
+    三种情形，不必依赖 TZ 环境变量（Windows 没有 time.tzset）。
+    """
+    try:
+        return datetime.datetime.now().astimezone().utcoffset()
+    except Exception:
+        return None
+
+
+def warn_timezone_skew(force=False):
+    """启动校验：本地时区不是 UTC+8 时告警一次（建议 TZ=Asia/Shanghai）。
+
+    时序已统一按 UTC+8 计算（见 now_utc8），此告警只提醒「容器时钟源与业务
+    时区不一致」：漏配 TZ 的容器里，看板/日志时间戳仍按本地时区渲染，排障时
+    容易对不上。COSY 签名对**时钟**敏感（漂移 >120s 直接 401），但那属于钟差、
+    与时区无关 —— 所以这里**只告警、不阻断**（不抛异常、不改任何状态）。
+    """
+    global _TZ_SKEW_WARNED
+    if _TZ_SKEW_WARNED and not force:
+        return
+    offset = _local_utc_offset()
+    if offset is None or offset == _UTC8_OFFSET:
+        _TZ_SKEW_WARNED = True
+        return
+    _TZ_SKEW_WARNED = True
+    try:
+        sys.stderr.write(
+            "[qoder] 容器本地时区不是 UTC+8（偏移 %s）。业务排程/日折叠已按 "
+            "UTC+8 计算，不受影响；建议设置 TZ=Asia/Shanghai 让日志时间戳也与"
+            "业务时钟对齐\n" % offset)
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 # 日折叠要回看的按天文件数量（当天 + 前 N-1 天；迁移期还要读旧 usage.jsonl）
 USAGE_FOLD_DAYS = 3
 
@@ -1840,14 +1883,24 @@ class Account(object):
         safe_uid = re.sub(r"[^A-Za-z0-9_-]", "_", str(self.uid or "")).strip("_ ")
         name = (safe_uid or uuid.uuid4().hex) + ".json"
         path = base / name
-        tmp = base / (name + ".tmp")
+        # tmp 名带 pid + uuid：跨进程并发写同一账号时各自一个中间文件，
+        # os.replace 到同一目标依然是原子语义（最后写者胜出），不会再互相踩出
+        # 半截 JSON（固定 uid.json.tmp 时两个进程同时写会落出坏文件）。
+        tmp = base / ("%s.%s.%d.tmp" % (name, uuid.uuid4().hex[:8], os.getpid()))
         if not (path.is_relative_to(base) and tmp.is_relative_to(base)):
             raise ValueError("invalid path for account save")
-        # 并发保护：/tasks 面板接口会并行刷新同一账号的多个字段（credits/plan/…），
-        # 每个都可能触发 save；同一 tmp 路径被两个线程同时写会落出坏 JSON。
-        with _SAVE_LOCK:
+        # 并发保护：① 进程内 _SAVE_LOCK 串行本进程线程（/tasks 面板会并行刷新
+        # 同一账号的多个字段）；② 进程外对账号目录的 flock(.save.lock) 把
+        # 「读-改-写」在多个网关实例之间也串行化（多实例部署补丁）。
+        with _SAVE_LOCK, _account_dir_flock(base):
             tmp.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2),
                            encoding="utf-8")
+            # 凭证文件落盘权限 0600（参照 _write_identity_cache_doc 的现成模式）：
+            # 账号 JSON 含明文 token，默认 umask 的 0644 会让同机其它用户读到。
+            try:
+                os.chmod(str(tmp), 0o600)
+            except OSError:
+                pass          # 不支持 chmod 的文件系统不应导致保存失败
             os.replace(tmp, path)
         self.path = str(path)
         return self.path
@@ -3663,6 +3716,8 @@ class AccountPool(object):
         self.quota_refresher = None
         # task-61 §2.6：临期加权轮询的运行期状态（uid -> 当前累计权重，重启即重置）
         self._expiry_weights = {}
+        # 启动时校验容器时区（业务时序已统一 UTC+8，告警只是提醒，不阻断启动）
+        warn_timezone_skew()
         _ACTIVE_POOL = self
 
     def load(self):

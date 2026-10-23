@@ -35,6 +35,27 @@ LEADER_LOCK_NAME = ".leader.lock"
 # 状态落盘防抖窗口（秒）：日志/状态变更合并批量写盘，不再每条日志写一次。
 _STATE_DEBOUNCE = 2.0
 
+# 本地轻量保活（HEAD 语义重放）：每 5 分钟最多一次，只看临期账号。
+# 与 22:00 集中保活互不替代：整点排程照旧由 _run_cycle 驱动，这里兜住
+# 「两轮排程之间就要过期」的账号（否则只能等下一次整点，期间请求会 401）。
+KEEPALIVE_TICK_INTERVAL = 300
+# 保活失败账号的停放时长（HEAD 的 skip_until 语义）：死号不每 5 分钟重试。
+_KEEPALIVE_PARK = 3600
+# 「临期」阈值必须与任务层 run_keepalive 的默认 threshold_seconds 一致
+# （qoder_tasks.py 默认 4*3600）；套件里有断言守卫这两个常量不漂移。
+_KEEPALIVE_THRESHOLD = 4 * 3600
+
+
+class _PoolView(object):
+    """只暴露 .accounts 的只读池视图。
+
+    qoder_tasks.run_keepalive 只读 pool.accounts（qoder_tasks.py:1009），
+    所以可以用它把「本轮要看的账号子集」喂进去，而不必改动任务层签名。
+    """
+
+    def __init__(self, accounts):
+        self.accounts = list(accounts or [])
+
 # 巡回来由：启动自动 / 整点排程 / 手动触发
 CYCLE_STARTUP = "startup"
 CYCLE_HOUR = "hour"
@@ -80,8 +101,16 @@ class Scheduler(object):
         # 签到/额度刷新并写 state.json；同一进程内同线程可重入
         self._leader_flock = qoder_accounts._named_flock(self._leader_lock_path())
         self._is_leader = True           # 单实例默认就是 leader；竞争失败时置 False
+        # 本地轻量保活的节流/互斥/停放状态（见 _local_keepalive_tick）
+        self._local_keepalive_mutex = threading.Lock()
+        self._last_keepalive_tick = 0.0
+        self._keepalive_parked = {}
+        # 启动时校验容器时区（业务时序已统一 UTC+8，告警只是提醒）
+        qoder_accounts.warn_timezone_skew()
         st = self._load_state()
-        self.enabled = bool(st.get("enabled", True))   # 看板开关重启后仍生效
+        # 内部状态用 _enabled：enabled 是 property（setter 会立即落盘），
+        # 构造期直接读盘恢复，不能顺带写一次 state.json。
+        self._enabled = bool(st.get("enabled", True))   # 看板开关重启后仍生效
         self._apply_schedule(st)                        # issue #70：排程配置持久化
         self.last_run_time = st.get("last_run_time") or None
         self.next_run_time = None
@@ -96,6 +125,18 @@ class Scheduler(object):
             self.log("调度器状态已从 %s 恢复（enabled=%s，上次运行 %s）"
                      % (self._state_path(), self.enabled,
                         self.last_run_time or "-"))
+
+    # -- 属性：开关变更立即落盘 --------------------------------------------
+    @property
+    def enabled(self):
+        return self._enabled
+
+    @enabled.setter
+    def enabled(self, value):
+        self._enabled = bool(value)
+        # 开关是用户动作：立即（force）持久化，不等 _STATE_DEBOUNCE 防抖窗口。
+        # 否则「面板点了暂停 -> 2 秒内进程被重启」会把暂停状态丢掉。
+        self._save_state(force=True)
 
     # -- 排程解析（issue #70） ----------------------------------------------
     @staticmethod
@@ -412,6 +453,12 @@ class Scheduler(object):
         # 现在改成「到点即补」：每 15s 检查一次「有没有已过点但还没触发的排程」，
         # 最多回补 3 小时内的漏点（进程重启也接得上）。
         while not self._stop_event.is_set():
+            # 本地轻量保活：内部自带 5 分钟节流 + 非阻塞互斥，不影响下面的排程
+            # 判定（跑满一轮最多几秒，不会推迟 _next_target() 的命中）。
+            try:
+                self._local_keepalive_tick()
+            except Exception as exc:
+                self.log("本地保活异常: %s" % exc)
             if self.enabled:
                 due = self._next_target()
                 if due is not None:
@@ -423,6 +470,57 @@ class Scheduler(object):
                     except Exception as exc:
                         self.log("排程执行异常: %s" % exc)
             self._stop_event.wait(15)
+
+    def _local_keepalive_tick(self):
+        """本地轻量保活（HEAD 语义重放）：临期 token 提前刷新，5 分钟最多一次。
+
+        与整点排程的关系：**互相独立**。22:00 的集中保活由 _run_cycle 按排程
+        驱动；这里只兜「两轮排程之间就快过期」的账号，否则它们要等到下一个
+        整点，期间上游请求只会 401。节流 + 非阻塞互斥都在本函数内，单轮最多
+        几秒，不会推迟 _next_target() 的命中。
+
+        为什么先筛账号再调 run_keepalive：任务层的 run_keepalive 没有 quiet
+        参数（签名见 qoder_tasks.py:998），空跑一轮也会把「所有账号 Token 均
+        未临近过期」写进看板日志 —— 每 5 分钟一条纯噪声。所以在调度器侧先做
+        同样的临期判定（阈值与任务层默认值绑定，见 _KEEPALIVE_THRESHOLD）。
+        失败账号停放 _KEEPALIVE_PARK 秒（HEAD 的 skip_until 语义），避免死号
+        每 5 分钟重试一次。
+        """
+        now = time.time()
+        if now - self._last_keepalive_tick < KEEPALIVE_TICK_INTERVAL:
+            return
+        self._last_keepalive_tick = now
+        if not self._enabled:
+            return
+        accounts = list(getattr(self.pool, "accounts", None) or [])
+        eligible = []
+        for acc in accounts:
+            uid = getattr(acc, "uid", "") or ""
+            if not getattr(acc, "enabled", False):
+                continue
+            if not getattr(acc, "access_token", ""):
+                continue
+            if self._keepalive_parked.get(uid, 0.0) > now:
+                continue
+            remain = (getattr(acc, "expires_at", 0) or 0) - now
+            if remain > _KEEPALIVE_THRESHOLD:
+                continue
+            eligible.append(acc)
+        if not eligible:
+            return
+        if not self._local_keepalive_mutex.acquire(blocking=False):
+            return
+        try:
+            ka = run_keepalive(_PoolView(eligible), force=False)
+            for uid in ka.get("failed_uids") or []:
+                self._keepalive_parked[uid] = time.time() + _KEEPALIVE_PARK
+            refreshed = int(ka.get("refreshed") or 0)
+            failed = int(ka.get("failed") or 0)
+            if refreshed or failed:
+                self.log("本地保活：刷新 %d 个，失败 %d 个"
+                         % (refreshed, failed))
+        finally:
+            self._local_keepalive_mutex.release()
 
     def _calc_next_fire(self):
         now = time.time()
@@ -438,7 +536,7 @@ class Scheduler(object):
 
     def trigger_now(self):
         """手动立即触发一次调度检查（不受"启动补签当日一次"闸门限制）。"""
-        if self._run_lock.locked():
+        if self._run_lock.locked() or self._local_keepalive_mutex.locked():
             return {"ok": False, "msg": "已有巡检正在执行，请稍候再试"}
         threading.Thread(target=self._execute_cycle,
                          args=("手动立即触发", CYCLE_MANUAL),
