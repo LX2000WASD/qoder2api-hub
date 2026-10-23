@@ -64,3 +64,20 @@ docker run -d --name qoder-proxy-minimal --restart=no --network host \
   -v /opt/qoder2api-hub/umid-home:/app/home \
   --entrypoint python qoder2api-hub:v1.8.1 qoder_proxy.py
 ```
+
+## 5. 生产切换（2026-10-23 23:49）
+
+compose 增加 `QD_MINIMAL_BODY=1` 并重建容器；启动日志 `prompt : minimal (no template system fallback)`。
+
+同一个 "HI" 请求：
+
+| 指标 | 切换前 | 切换后 |
+|---|---:|---:|
+| prompt_tokens | **2,652** | **106** |
+| cached_tokens | 2,646 | 0 |
+| body_bytes | ~14 KB | **1,876 B** |
+| prompt_src / prompt_chars / tools_n | template / 12,324 / 0 | none / 0 / 0 |
+| system_sha | 非空 | **空** |
+
+固定开销验证（minimal 模式）：`HI`(2 字符)=106、`A`(1 字符)=106、320 字中文=265 tokens → **106 是上游固定开销，不含我们的提示词**。
+三协议冒烟全 200；容器 healthy、RestartCount 0。回滚：删掉该环境变量再 `up -d`。
